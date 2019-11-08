@@ -101,7 +101,10 @@ The `qvm-sync` scheme is roughly similar, but,
   - For each file in requestlist without `crc`, send over to receiver. 
   - For each file _with_ `crc`, compare against local, and send over if it differs. 
 
-For the first version, I'll probably skip `crc`, and just send indexes. 
+For the first version, I'll probably skip `crc`, and just send indexes. That makes
+everything a whole lot simpler, which is particularly beneficial on the `initiator`
+side -- since the `initiator` is not `chroot`:ed, it would be nice to keep the
+input parsing from the remote side to a minimum. 
 
 The indices do not count directories, so for syncing the following directory: 
 ```
@@ -113,11 +116,12 @@ a/
 The following data is sent, (with indices in parenthesis -- not actually transmitted over the wire):
 ```
 a       (none)
-a/foo   (0)
+a/foo   (1)
 a/b/    (none)
-a/b/bar (1)
+a/b/bar (2)
 a/b/    (none) // end-dir marker
 a/      (none) // end-dir marker
 EOT     (none) // end-of-transfer marker
 ```
+Note: indices start at `1`, so that `0` can be used to signal `end-of-list`
 And thus, a valid request list can only contain indices `[0,1]`. 

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"syscall"
 )
@@ -13,149 +14,143 @@ const (
 )
 
 type fileHeader struct {
-	nameLen   uint32
-	mode      uint32
-	fileLen   uint64
-	atime     uint32
-	atimeNsec uint32
-	mtime     uint32
-	mtimeNsec uint32
+	Data fileHeaderData
+	path string
+}
+type fileHeaderData struct {
+	NameLen   uint32
+	Mode      uint32
+	FileLen   uint64
+	Atime     uint32
+	AtimeNsec uint32
+	Mtime     uint32
+	MtimeNsec uint32
 }
 
-func newFileHeader(fileName string, info os.FileInfo) *fileHeader {
+func newFileHeaderFromStat(path string, info os.FileInfo) *fileHeader {
 	stat := info.Sys().(*syscall.Stat_t)
-	hdr := &fileHeader{
-		mode:      uint32(info.Mode()),
-		mtime:     uint32(stat.Mtim.Sec),
-		mtimeNsec: uint32(stat.Mtim.Nsec),
-		atime:     uint32(stat.Atim.Sec),
-		atimeNsec: uint32(stat.Atim.Nsec),
-		fileLen:   uint64(stat.Size),
-		nameLen:   uint32(len(fileName) + 1),
+	data := fileHeaderData{
+		Mode:      uint32(info.Mode()),
+		Mtime:     uint32(stat.Mtim.Sec),
+		MtimeNsec: uint32(stat.Mtim.Nsec),
+		Atime:     uint32(stat.Atim.Sec),
+		AtimeNsec: uint32(stat.Atim.Nsec),
+		FileLen:   uint64(stat.Size),
+		NameLen:   uint32(len(path) + 1),
 	}
 	if info.Mode().IsDir() {
-		hdr.fileLen = 0
+		data.FileLen = 0
 	}
-	return hdr
+	return &fileHeader{
+		path: path,
+		Data: data,
+	}
 }
 
-func (hdr *fileHeader) marshallBinary(filename string) []byte {
-	var buf []byte
-	if len(filename) != 0 {
-		buf = make([]byte, 32+len(filename)+1)
-	} else {
-		buf = make([]byte, 32)
+func (hdr *fileHeader) marshallBinary(out io.Writer) error {
+	if err := binary.Write(out, binary.LittleEndian, hdr.Data); err != nil {
+		return err
 	}
-	binary.LittleEndian.PutUint32(buf[0:], hdr.nameLen)
-	binary.LittleEndian.PutUint32(buf[4:], hdr.mode)
-	binary.LittleEndian.PutUint64(buf[8:], hdr.fileLen)
-	binary.LittleEndian.PutUint32(buf[16:], hdr.atime)
-	binary.LittleEndian.PutUint32(buf[20:], hdr.atimeNsec)
-	binary.LittleEndian.PutUint32(buf[24:], hdr.mtime)
-	binary.LittleEndian.PutUint32(buf[28:], hdr.mtimeNsec)
-	// filename + zero suffix
-
-	//fmt.Fprintf(os.Stderr,"name: %v\n", filename)
-	//fmt.Fprintf(os.Stderr,"  namelen %x\n",buf[0:4])
-	//fmt.Fprintf(os.Stderr,"  mode %x\n",buf[4:8])
-	//fmt.Fprintf(os.Stderr,"  fileLen %x\n",buf[8:16])
-	//fmt.Fprintf(os.Stderr,"  atime %x\n",buf[16:20])
-	//fmt.Fprintf(os.Stderr,"  atimeNsec %x\n",buf[20:24])
-	//fmt.Fprintf(os.Stderr,"  mtime %x\n",buf[24:28])
-	//fmt.Fprintf(os.Stderr,"  mtimeNsec %x\n",buf[28:32])
-	copy(buf[32:], []byte(filename))
-	return buf
-}
-
-func (hdr *fileHeader) unMarshallBinary(reader io.Reader) error {
-	buf := make([]byte, 32)
-	n, err := reader.Read(buf)
-	if n == 32 {
-		hdr.nameLen = binary.LittleEndian.Uint32(buf[0:])
-		hdr.mode = binary.LittleEndian.Uint32(buf[4:])
-		hdr.fileLen = binary.LittleEndian.Uint64(buf[8:])
-		hdr.atime = binary.LittleEndian.Uint32(buf[16:])
-		hdr.atimeNsec = binary.LittleEndian.Uint32(buf[20:])
-		hdr.mtime = binary.LittleEndian.Uint32(buf[24:])
-		hdr.mtimeNsec = binary.LittleEndian.Uint32(buf[28:])
-	} else {
-		return fmt.Errorf("could only read %d bytes, need 32 , err: %v", n, err)
-	}
-	// drop zero suffix
-	if hdr.nameLen > 0 {
-		if hdr.nameLen > MaxPathLength-1 {
-			return fmt.Errorf("too large file name, %d characters", hdr.nameLen)
-		}
+	if err := WritePath(out, hdr.path); err != nil {
+		return err
 	}
 	return nil
+}
+
+func unMarshallBinary(reader io.Reader) (*fileHeader, error) {
+	var data fileHeaderData
+	if err := binary.Read(reader, binary.LittleEndian, &data); err != nil {
+		return nil, err
+	}
+	path, err := ReadPath(reader, data.NameLen)
+	if err != nil {
+		return nil, err
+	}
+	return &fileHeader{
+		path: path,
+		Data: data,
+	}, nil
+}
+
+func (hdr *fileHeader) Eq(other *fileHeader) bool {
+	var errs []string
+	if a, b := hdr.Data.NameLen, other.Data.NameLen; a != b {
+		errs = append(errs, fmt.Sprintf("NameLen %d != %d", a, b))
+	}
+	if a, b := hdr.Data.Mode, other.Data.Mode; a != b {
+		errs = append(errs, fmt.Sprintf("Mode %x != %x", a, b))
+	}
+	if a, b := hdr.Data.FileLen, other.Data.FileLen; a != b {
+		errs = append(errs, fmt.Sprintf("FileLen %d != %d", a, b))
+	}
+	if !(hdr.isSymlink() && other.isSymlink()) {
+		// Ignore comparing atime/mtime for symlinks, since we
+		// cannot set the times/perms on those when syncing, so they will
+		// basically always yield errors
+		if a, b := hdr.Data.Atime, other.Data.Atime; a != b {
+			errs = append(errs, fmt.Sprintf("Atime %d != %d", a, b))
+		}
+		if a, b := hdr.Data.AtimeNsec, other.Data.AtimeNsec; a != b {
+			errs = append(errs, fmt.Sprintf("AtimeNsec %d != %d", a, b))
+		}
+		if a, b := hdr.Data.Mtime, other.Data.Mtime; a != b {
+			errs = append(errs, fmt.Sprintf("Mtime %d != %d", a, b))
+		}
+		if a, b := hdr.Data.MtimeNsec, other.Data.MtimeNsec; a != b {
+			errs = append(errs, fmt.Sprintf("MtimeNsec %d != %d", a, b))
+		}
+	}
+	if len(errs) != 0 {
+		log.Printf("file diffs for %v: %v", hdr.path, errs)
+		return false
+	}
+	return true
+}
+
+func (hdr *fileHeader) isRegular() bool {
+	return os.FileMode(hdr.Data.Mode).IsRegular()
+}
+func (hdr *fileHeader) isSymlink() bool {
+	return os.FileMode(hdr.Data.Mode)&os.ModeSymlink != 0
+}
+func (hdr *fileHeader) isDir() bool {
+	return os.FileMode(hdr.Data.Mode).IsDir()
 }
 
 type resultHeader struct {
-	errorCode uint32
-	pad       uint32
-	crc32     uint64
+	ErrorCode uint32
+	Pad       uint32
+	Crc32     uint64
 }
 
 func (hdr *resultHeader) unMarshallBinary(in io.Reader) error {
-
-	if err := binary.Read(in, binary.LittleEndian, hdr.errorCode); err != nil {
-		return err
-	}
-	if err := binary.Read(in, binary.LittleEndian, hdr.pad); err != nil {
-		return err
-	}
-	return binary.Read(in, binary.LittleEndian, hdr.crc32)
+	return binary.Read(in, binary.LittleEndian, hdr)
 }
 
 func (hdr *resultHeader) marshallBinary(out io.Writer) error {
-	if err := binary.Write(out, binary.LittleEndian, hdr.errorCode); err != nil {
-		return err
-	}
-	if err := binary.Write(out, binary.LittleEndian, hdr.pad); err != nil {
-		return err
-	}
-	return binary.Write(out, binary.LittleEndian, hdr.crc32)
+	return binary.Write(out, binary.LittleEndian, hdr)
 }
 
-//
-///* optional info about last processed file */
-//struct result_header_ext {
-//    uint32_t last_namelen;
-//    char last_name[0];
-//} __attribute__((packed));
-//
-
+//resultHeaderExt contains info about last processed file
 type resultHeaderExt struct {
-	lastNameLen uint32
-	lastName    string
+	LastNameLen uint32
+	LastName    string
 }
 
 func (hdr *resultHeaderExt) marshallBinary(out io.Writer) error {
-	if err := binary.Write(out, binary.LittleEndian, hdr.lastNameLen); err != nil {
+	if err := binary.Write(out, binary.LittleEndian, hdr.LastNameLen); err != nil {
 		return err
 	}
-	buf := make([]byte, hdr.lastNameLen)
-	copy(buf, []byte(hdr.lastName))
-	_, err := out.Write(buf)
-	return err
+	return WritePath(out, hdr.LastName)
 }
 
 func (hdr *resultHeaderExt) unMarshallBinary(in io.Reader) error {
-
-	if err := binary.Read(in, binary.LittleEndian, hdr.lastNameLen); err != nil {
+	err := binary.Read(in, binary.LittleEndian, &hdr.LastNameLen)
+	if err != nil {
 		return err
 	}
-	if hdr.lastNameLen > MaxPathLength {
-		hdr.lastNameLen = MaxPathLength
-	}
-	buf := make([]byte, hdr.lastNameLen)
-	if n, err := in.Read(buf); n != int(hdr.lastNameLen) {
-		return fmt.Errorf("failed parsing result, wanted %d bytes, got %d (err: %v)", hdr.lastNameLen, n, err)
-	}
-	if hdr.lastNameLen > 0 {
-		hdr.lastName = string(buf[:int(hdr.lastNameLen)-1])
-	}
-	return nil
+	hdr.LastName, err = ReadPath(in, hdr.LastNameLen)
+	return err
 }
 
 func CopyFile(input io.Reader, output io.Writer, length int) error {
@@ -171,9 +166,6 @@ func CopyFile(input io.Reader, output io.Writer, length int) error {
 		if err != nil {
 			return err
 		}
-		if n == 0 {
-			return fmt.Errorf("eof reading data")
-		}
 		// write a chunk
 		if _, err := output.Write(buf[:n]); err != nil {
 			return err
@@ -181,4 +173,44 @@ func CopyFile(input io.Reader, output io.Writer, length int) error {
 		length -= n
 	}
 	return nil
+}
+
+// reads a NULL-terminated string from r
+func ReadPath(in io.Reader, length uint32) (string, error) {
+	if length > MaxPathLength-1 {
+		return "", fmt.Errorf("path too large (%d characters)", length)
+	}
+	if length == 0 {
+		return "", nil
+	}
+	nBuf := make([]byte, length)
+	if n, err := io.ReadFull(in, nBuf); err != nil {
+		return "", fmt.Errorf("read err, wanted %d, got only %d: %v", length, n, err)
+	}
+	if nBuf[length-1] != 0 {
+		return "", fmt.Errorf("expected NULL-terminated string")
+	}
+	return string(nBuf[:length-1]), nil
+}
+
+// write strings as a null-terminated string to out
+func WritePath(out io.Writer, path string) error {
+	// write path with zero-suffix
+	if len(path) != 0 {
+		buf := make([]byte, len(path)+1)
+		copy(buf, path)
+		_, err := out.Write(buf)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func RemoveIfExist(path string) error {
+	_, err := os.Lstat(path)
+	if err != nil && os.IsNotExist(err) {
+		return nil
+	}
+	return os.Remove(path)
+
 }

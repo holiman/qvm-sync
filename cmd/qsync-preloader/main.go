@@ -147,6 +147,8 @@ func execJailed(uname, jail, trustedBinary string) error {
 	if err := os.Chdir(destRoot); err != nil {
 		return fmt.Errorf("failed chdir: %v", err)
 	}
+	// I'm actually unsure if this mount/unmount dance actually
+	// accomplishes anything ...
 	if err := syscall.Mount(".", ".", "", syscall.MS_BIND|syscall.MS_NODEV|syscall.MS_NOEXEC|syscall.MS_NOSUID, ""); err != nil {
 		return fmt.Errorf("failed mounting '.': %v", err)
 	}

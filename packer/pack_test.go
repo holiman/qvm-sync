@@ -5,8 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
 	"reflect"
-
 	"testing"
 )
 
@@ -22,10 +25,11 @@ qvm-sync]$ /usr/lib/qubes/qfile-agent testdata/afile.txt | xxd
 */
 func TestPackFile(t *testing.T) {
 	exp, _ := hex.DecodeString("0a000000b48100000c00000000000000f781c05d80b86723cd81c05dc03d751e6166696c652e7478740068656c6c6f20776f726c640a0000000000000000000000000000000000000000000000000000000000000000")
-
-	name := "./testdata/afile.txt"
 	buf := bytes.NewBuffer(nil)
-	if err := OsWalk(name, true, buf); err != nil {
+	r := NewSender(buf, nil, true)
+	name := "./testdata/afile.txt"
+
+	if err := r.OsWalk(name); err != nil {
 		t.Fatal(err)
 	}
 	got := buf.Bytes()
@@ -57,7 +61,9 @@ func TestPackSymlink(t *testing.T) {
 
 	name := "./testdata/alink.foo"
 	buf := bytes.NewBuffer(nil)
-	if err := OsWalk(name, false, buf); err != nil {
+	r := NewSender(buf, nil, true)
+
+	if err := r.OsWalk(name); err != nil {
 		t.Fatal(err)
 	}
 	got := buf.Bytes()
@@ -80,7 +86,7 @@ func TestPackSymlink(t *testing.T) {
 00000090: 7461 2f61 6669 6c65 2e74 7874 1300 0000  ta/afile.txt....
 000000a0: b481 0000 0c00 0000 0000 0000 f781 c05d  ...............]
 000000b0: 80b8 6723 cd81 c05d c03d 751e 7465 7374  ..g#...].=u.test
-000000c0: 6461 7461 2f61 6669 6c65 2e74 7874 0068  data/afile.txt.h
+000000c0: 6461 7461 2f61 6669 6c65 2e74 7874 0068  Data/afile.txt.h
 000000d0: 656c 6c6f 2077 6f72 6c64 0a09 0000 00fd  ello world......
 000000e0: 4100 0000 0000 0000 0000 005b 91c0 5d00  A..........[..].
 000000f0: 7c31 255a 91c0 5d80 9245 0774 6573 7464  |1%Z..]..E.testd
@@ -110,13 +116,14 @@ func TestWalk(t *testing.T) {
 	//"0000 0000"
 
 	//exps = strings.Replace(exps," ", "", -1)
-	// The data above fails, because in file.go, ReadDir overrides lstat with stat for tests,
+	// The Data above fails, because in file.go, ReadDir overrides lstat with stat for tests,
 	// so in this test the symlink becomes read as a regular file
 	exps := "09000000fd4100000000000000000000f448c15d80f5e4095a91c05d8092450774657374646174610013000000b48100000c00000000000000f781c05d80b86723cd81c05dc03d751e74657374646174612f6166696c652e7478740068656c6c6f20776f726c640a13000000ffa1000040000000000000005b91c05d007c31255a91c05d8092450774657374646174612f616c696e6b2e666f6f002f686f6d652f757365722f676f2f7372632f6769746875622e636f6d2f686f6c696d616e2f71766d2d73796e632f74657374646174612f6166696c652e74787409000000fd4100000000000000000000f448c15d80f5e4095a91c05d809245077465737464617461000000000000000000000000000000000000000000000000000000000000000000"
 	exp, _ := hex.DecodeString(exps)
 	name := "./testdata"
 	buf := bytes.NewBuffer(nil)
-	OsWalk(name, false, buf)
+	r := NewSender(buf, nil, true)
+	r.OsWalk(name)
 
 	got := buf.Bytes()
 	if !bytes.Equal(got, exp) {
@@ -127,37 +134,103 @@ func TestWalk(t *testing.T) {
 
 func TestMarshalUnMarshal(t *testing.T){
 
+	var fromBin = func(data []byte) (*fileHeader, error){
+		r := bytes.NewReader(data)
+		return unMarshallBinary(r)
+	}
+	var toBin = func(hdr *fileHeader) ([]byte, error){
+		outb := bytes.NewBuffer(nil)
+		err := hdr.marshallBinary(outb)
+		return outb.Bytes(), err
+	}
+
 	var hdr fileHeader
 	{
 		in := make([]byte, 32)
 		rand.Read(in)
 		// set name length explicitly to zero
 		copy(in[0:], []byte{0,0,0,0})
-		r := bytes.NewReader(in)
-		hdr.unMarshallBinary(r)
-		out := hdr.marshallBinary("")
+		hdr,err  := fromBin(in)
+		if err != nil{
+			t.Fatal(err)
+		}
+		out, err := toBin(hdr)
+		if err != nil{
+			t.Fatal(err)
+		}
 		if !bytes.Equal(out, in){
 			t.Fatalf("input: \n%x\n != output:\n%x\n", in, out)
 		}
 	}
 
 	{
-		exp := "abcde"
-		hdr.nameLen = uint32(len(exp))
-		out2 := hdr.marshallBinary(exp)
-		var hdr2 fileHeader
-
-		err := hdr2.unMarshallBinary(bytes.NewReader(out2))
+		hdr.path = "abcde"
+		hdr.Data.NameLen = uint32(len(hdr.path)+1)
+		out, err := toBin(&hdr)
 		if err != nil{
 			t.Fatal(err)
 		}
-		//if got != exp{
-		//	t.Fatalf("name wrong, got %v exp %v", got, exp)
-		//}
-		if !reflect.DeepEqual(hdr, hdr2){
+
+		hdr2,err  := fromBin(out)
+		if err != nil{
+			t.Fatal(err)
+		}
+
+		if err != nil{
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(&hdr, hdr2){
 			t.Fatalf("err: %v != %v", hdr, hdr2)
 		}
 	}
+}
 
+
+func TestEntireDirectory(t *testing.T){
+
+	pipeOneIn, pipeOneOut := io.Pipe()
+	pipeTwoIn, pipeTwoOut := io.Pipe()
+
+	// Resolve the syncsource before we chdir
+	syncSource, err := filepath.Abs("./testdata")
+	if err != nil{
+		t.Fatal(err)
+	}
+
+	if err := os.Chdir("/tmp/"); err != nil{
+		t.Fatal(err)
+	}
+
+	var send = func(){
+		defer pipeOneOut.Close()
+		sender := NewSender(pipeOneOut, pipeTwoIn, false)
+		if err := sender.Sync(syncSource); err != nil{
+			t.Fatal(err)
+		}
+		// wait for response
+		log.Print("Sender all done")
+	}
+
+	var recv = func(){
+		defer pipeTwoOut.Close()
+
+		r := NewReceiver(pipeOneIn, pipeTwoOut, false)
+		// Receive directories + metadata
+		if err := r.ReceiveMetadata(); err != nil {
+			t.Fatalf("Error during unpack [1]: %v", err)
+		}
+		// Request files
+		if err := r.RequestFiles(); err != nil {
+			t.Fatalf("Error during file request: %v", err)
+		}
+		// Receive Data content
+		if err := r.ReceiveFullData(); err != nil {
+			t.Fatalf("Error during unpack [2]: %v", err)
+		}
+		log.Printf("Receiver all done")
+	}
+
+	go send()
+	recv()
 
 }

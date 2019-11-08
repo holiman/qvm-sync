@@ -1,6 +1,7 @@
 package packer
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -10,366 +11,310 @@ import (
 )
 
 const (
-	useTempFile = true
-	LongMax     = 9223372036854775807
-	ByteLimit   = 0
-	verbose     = true
-	filesLimit  = -1
+	// The original qvm-copy uses LongMax (9223372036854775807 = 9223 PB) as
+	// max. I choose something smaller, 1TB ought to suffice
+	MaxTransfer = 1e12
 )
 
-var (
-	totalBytes = uint64(0)
-	totalFiles = uint64(0)
-)
-
-/*
-
-void fix_times_and_perms(struct file_header *untrusted_hdr,
-        const char *untrusted_name)
-{
-    struct timeval times[2] =
-    {
-        {untrusted_hdr->atime, untrusted_hdr->atime_nsec / 1000},
-        {untrusted_hdr->mtime, untrusted_hdr->mtime_nsec / 1000}
-    };
-    if (chmod(untrusted_name, untrusted_hdr->mode & 07777))  // safe because of chroot
-        do_exit(errno, untrusted_name);
-    if (utimes(untrusted_name, times))  //as above
-        do_exit(errno, untrusted_name);
-}
-*/
-
-func fixTimesAndPerms(untrustedHeader *fileHeader, untrustedName string) error {
-	if err := os.Chmod(untrustedName, os.FileMode(untrustedHeader.mode&07777)); err != nil {
+// fixTimesAndPerms set permissions on a the given file/directory according to
+// the fileHeader
+//
+// Setting permissions doesn't work on symlinks. Chmod docs:
+//
+// > If the file is a symbolic link, it changes the mode of the link's target.
+//
+// And similarly, it's not possible to do ChTimes on a symlink, as golang will always
+// resolve the symlinks, see https://github.com/golang/go/issues/3951
+//
+// - Invoking os.Chtimes on a symlink that resolves to some existing file will
+//   in actuality change the other file.
+// - Invoking os.Chtimes on a symlink that doesn't resolve to an existing file at
+//   all, will return an error (no such file or directory).
+func fixTimesAndPerms(hdr *fileHeader) error {
+	if err := os.Chmod(hdr.path, os.FileMode(hdr.Data.Mode&07777)); err != nil {
 		return err
 	}
-
-	atime := time.Unix(int64(untrustedHeader.atime), int64(untrustedHeader.atimeNsec))
-	mtime := time.Unix(int64(untrustedHeader.mtime), int64(untrustedHeader.mtimeNsec))
-	return os.Chtimes(untrustedName, atime, mtime)
+	atime := time.Unix(int64(hdr.Data.Atime), int64(hdr.Data.AtimeNsec))
+	mtime := time.Unix(int64(hdr.Data.Mtime), int64(hdr.Data.MtimeNsec))
+	return os.Chtimes(hdr.path, atime, mtime)
 }
 
-//
-//void process_one_file_reg(struct file_header *untrusted_hdr,
-//        const char *untrusted_name)
-//{
-//    int ret;
-//    int fdout = -1;
-//
-//    /* make the file inaccessible until fully written */
-//    if (use_tmpfile) {
-//        fdout = open(".", O_WRONLY | O_TMPFILE, 0700);
-//        if (fdout < 0) {
-//            if (errno==ENOENT || /* most likely, kernel too old for O_TMPFILE */
-//                    errno==EOPNOTSUPP) /* filesystem has no support for O_TMPFILE */
-//                use_tmpfile = 0;
-//            else
-//                do_exit(errno, untrusted_name);
-//        }
-//    }
-//    if (fdout < 0)
-//        fdout = open(untrusted_name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0000); /* safe because of chroot */
-//    if (fdout < 0)
-//        do_exit(errno, untrusted_name);
-//    /* sizes are signed elsewhere */
-//    if (untrusted_hdr->filelen > LLONG_MAX || (bytes_limit && untrusted_hdr->filelen > bytes_limit))
-//        do_exit(EDQUOT, untrusted_name);
-//    if (bytes_limit && total_bytes > bytes_limit - untrusted_hdr->filelen)
-//        do_exit(EDQUOT, untrusted_name);
-//    total_bytes += untrusted_hdr->filelen;
-//    ret = copy_file(fdout, 0, untrusted_hdr->filelen, &crc32_sum);
-//    if (ret != COPY_FILE_OK) {
-//        if (ret == COPY_FILE_READ_EOF
-//                || ret == COPY_FILE_READ_ERROR)
-//            do_exit(LEGAL_EOF, untrusted_name); // hopefully remote will produce error message
-//        else
-//            do_exit(errno, untrusted_name);
-//    }
-//    if (use_tmpfile) {
-//        char fd_str[7];
-//        snprintf(fd_str, sizeof(fd_str), "%d", fdout);
-//        if (linkat(procdir_fd, fd_str, AT_FDCWD, untrusted_name, AT_SYMLINK_FOLLOW) < 0)
-//            do_exit(errno, untrusted_name);
-//    }
-//    close(fdout);
-//    fix_times_and_perms(untrusted_hdr, untrusted_name);
-//}
-//
-func receiveRegularFile(untrustedHeader *fileHeader, untrustedName string, input io.Reader) error {
+type Receiver struct {
+	in  io.Reader
+	out io.Writer
 
+	useTempFile bool // Should it unpack into tempfiles first?
+	verbose     bool // verbose output
+
+	totalBytes uint64 // counter for total bytes received
+	totalFiles uint64 // counter for total files received
+
+	filesLimit int    // a limit on the number of files to receive
+	byteLimit  uint64 // limit on the number of bytes to receive
+
+	index       uint32   // index count,for requesting
+	requestList []uint32 // list of files (indexes) to request
+
+	dirStack []string // stack of directories we visit/create
+
+	// place to store stuff in. Defaults to empty string, as we're normally
+	// root-jailed, but is used for testing
+	root string
+}
+
+// NewReceiver creates a new receiver
+func NewReceiver(in io.Reader, out io.Writer, verbose bool) *Receiver {
+	return &Receiver{
+		in:          in,
+		out:         out,
+		filesLimit:  -1,
+		useTempFile: true,
+		verbose:     verbose,
+	}
+}
+
+// request schedules a certain index for later retrieval
+func (r *Receiver) request(index uint32) {
+	r.requestList = append(r.requestList, r.index)
+}
+
+// countBytes verifies that the length is within limits, and updates bytecounter
+func (r *Receiver) countBytes(length uint64, update bool) error {
+	if length > MaxTransfer {
+		return fmt.Errorf("file too large, %d", length)
+	}
+	if r.byteLimit != 0 && r.totalBytes > uint64(r.byteLimit)-length {
+		return fmt.Errorf("file too large, %d", length)
+	}
+	if update {
+		r.totalBytes += length
+	}
+	return nil
+}
+
+// receiveFileMetadata handles stage-1 metadata for files and symlinks
+func (r *Receiver) receiveFileMetadata(hdr *fileHeader) error {
+	defer func() { r.index++ }()
 	// Check sizes
-	fLen := untrustedHeader.fileLen
-	if fLen > LongMax || (ByteLimit != 0 && fLen > ByteLimit) {
-		return fmt.Errorf("file too large, %d", fLen)
+	if err := r.countBytes(hdr.Data.FileLen, false); err != nil {
+		return err
 	}
-	if ByteLimit != 0 && totalBytes > uint64(ByteLimit)-fLen {
-		return fmt.Errorf("file too large, %d", fLen)
+	localFileInfo, err := os.Lstat(hdr.path)
+	if err != nil && os.IsNotExist(err) {
+		r.request(r.index)
+		return nil
 	}
-	totalBytes += fLen
+	localFile := newFileHeaderFromStat(hdr.path, localFileInfo)
+	if !localFile.Eq(hdr) {
+		r.request(r.index)
+	}
+	return nil
+}
+
+// receiveDirMetadata handles directories (stage 1). Since qvm-sync, as opposed to qvm-copy,
+// cannot rely on the destination being empty, we need to handle various
+// corner cases (e.g directory exists but is file, or vice versa)
+func (r *Receiver) receiveDirMetadata(header *fileHeader) error {
+	// qvm-copy operates on a 'clean' empty destination, so that one can
+	// safely assume that if it already exists, this is the second time they
+	// visit it (backing out), and set the final perms that time around.
+	// We can't do that, but instead maintain a stack of directories. We
+	// can consult it to find it if
+	// 1. we're now backing out of a dir, or,
+	// 2. We're visiting/creating one for the first time
+	if r.visitDir(header.path) {
+		//abs, _ := filepath.Abs(header.path)
+		// first visit
+		if stat, err := os.Lstat(header.path); err == nil {
+			// directory already exists -- make sure it's a dir -- otherwise delete
+			if stat.IsDir() {
+				return nil // TODO: consider if we should change perms to 0700 here..?
+			}
+			if err := RemoveIfExist(header.path); err != nil {
+				return err
+			}
+		}
+		// Dir did not exist (or was removed)
+		return os.Mkdir(header.path, 0700)
+	}
+	log.Printf("Fixing perms for %v", header.path)
+	// second visit
+	// we fix the perms after we're done with it
+	return fixTimesAndPerms(header)
+}
+
+func (r *Receiver) receiveRegularFileFullData(hdr *fileHeader) error {
+	// Check sizes
+	if err := r.countBytes(hdr.Data.FileLen, true); err != nil {
+		return err
+	}
 	var (
 		fdOut *os.File
 		err   error
 	)
-	if useTempFile {
-		fdOut, err = ioutil.TempFile(".", "qvm-*")
-	} else {
-		fdOut, err = os.OpenFile(untrustedName, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0)
+	if !r.useTempFile {
+		// TODO, handle if file already exist
+		if fdOut, err = os.OpenFile(hdr.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0); err != nil {
+			return err
+		}
+		// we can't do deferred fdOut.Close, because we need to fix perms
+		// _after_ file has been closed
+		if err := CopyFile(r.in, fdOut, int(hdr.Data.FileLen)); err != nil {
+			fdOut.Close()
+			return err
+		}
+		fdOut.Close()
+		fixTimesAndPerms(hdr)
 	}
-	if err != nil {
+	// Create tempfile
+	if fdOut, err = ioutil.TempFile(".", "qvm-*"); err != nil {
 		return err
 	}
 	defer fdOut.Close()
-	if err := CopyFile(input, fdOut, int(fLen)); err != nil {
+	defer os.Remove(fdOut.Name()) // defer cleanup
+	if err := CopyFile(r.in, fdOut, int(hdr.Data.FileLen)); err != nil {
 		return err
 	}
-	if useTempFile {
-		// Regardless of error, clean up tempfile
-		defer os.Remove(fdOut.Name())
-		if err := os.Link(fdOut.Name(), untrustedName); err != nil {
-			return err
-		}
+	// This file may already exist.
+	if err := RemoveIfExist(hdr.path); err != nil {
+		return err
 	}
-	return fixTimesAndPerms(untrustedHeader, untrustedName)
+	if err := os.Link(fdOut.Name(), hdr.path); err != nil {
+		return fmt.Errorf("unable to link file : %v", err)
+	}
+	return fixTimesAndPerms(hdr)
 }
 
-//
-//void process_one_file_dir(struct file_header *untrusted_hdr,
-//        const char *untrusted_name)
-//{
-//    // fix perms only when the directory is sent for the second time
-//    // it allows to transfer r.x directory contents, as we create it rwx initially
-//    struct stat buf;
-//    if (!mkdir(untrusted_name, 0700)) /* safe because of chroot */
-//        return;
-//    if (errno != EEXIST)
-//        do_exit(errno, untrusted_name);
-//    if (stat(untrusted_name,&buf) < 0)
-//        do_exit(errno, untrusted_name);
-//    total_bytes += buf.st_size;
-//    /* size accumulated after the fact, so don't check limit here */
-//    fix_times_and_perms(untrusted_hdr, untrusted_name);
-//}
-//
-func receiveDir(untrustedHeader *fileHeader, untrustedName string, input io.Reader) error {
-
-	if _, err := os.Stat(untrustedName); err == nil {
-		// directory already exists
+func (r *Receiver) receiveSymlinkFullData(hdr *fileHeader) error {
+	fileSize := hdr.Data.FileLen
+	if fileSize > MaxPathLength-1 {
+		return fmt.Errorf("symlink link-name too long (%d characters)", fileSize)
 	}
-	// safe because of chroot
-	if err := os.Mkdir(untrustedName, 0700); err != nil {
-		if !os.IsExist(err) {
-			return err
-		}
-		// Already exists, that's fine, it means it's the second time
-		// around we hit this (dir end)
-		// we fix the perms after we're done with it (second time around)
-		return fixTimesAndPerms(untrustedHeader, untrustedName)
-	} else {
-		// Dir created, exit
-		return nil
+	if err := r.countBytes(fileSize, true); err != nil {
+		return err
 	}
-}
-
-//
-//void process_one_file_link(struct file_header *untrusted_hdr,
-//        const char *untrusted_name)
-//{
-//    char untrusted_content[MAX_PATH_LENGTH];
-//    unsigned int filelen;
-//    if (untrusted_hdr->filelen > MAX_PATH_LENGTH - 1)
-//        do_exit(ENAMETOOLONG, untrusted_name);
-//    filelen = untrusted_hdr->filelen; /* sanitized above */
-//    total_bytes += filelen;
-//    if (bytes_limit && total_bytes > bytes_limit)
-//        do_exit(EDQUOT, untrusted_name);
-//    if (!read_all_with_crc(0, untrusted_content, filelen))
-//        do_exit(LEGAL_EOF, untrusted_name); // hopefully remote has produced error message
-//    untrusted_content[filelen] = 0;
-//    if (symlink(untrusted_content, untrusted_name)) /* safe because of chroot */
-//        do_exit(errno, untrusted_name);
-//
-//}
-//
-
-func receiveSymlink(untrustedHeader *fileHeader, untrustedName string, input io.Reader) error {
-	fLen := untrustedHeader.fileLen
-	if fLen > MaxPathLength-1 {
-		return fmt.Errorf("file name too long (%d characters)", fLen)
-	}
-	if ByteLimit != 0 && totalBytes > uint64(ByteLimit)-fLen {
-		return fmt.Errorf("file too large, %d", fLen)
-	}
-	totalBytes += fLen
 	// a symlink should be small enough to not use CopyFile (buffered)
-	buf := make([]byte, fLen)
-	if n, _ := input.Read(buf); uint64(n) != fLen {
-		return fmt.Errorf("read err, wanted %d, got only %d", fLen, n)
+	buf := make([]byte, fileSize)
+	if _, err := io.ReadFull(r.in, buf); err != nil {
+		return fmt.Errorf("symlink content read err: %v", err)
 	}
-	untrustedContent := string(buf[:fLen-1])
-	return os.Symlink(untrustedContent, untrustedName)
+	content := string(buf)
+	// This file may already exist.
+	RemoveIfExist(hdr.path)
+	if err := os.Symlink(content, hdr.path); err != nil {
+		return err
+	}
+	// OBS! We can't set perms _nor_ times on symlinks. See documentation
+	// on the methods fixTimesAndPerms and fixTimes
+	return nil
 }
 
-//
-//
-//void process_one_file(struct file_header *untrusted_hdr)
-//{
-//    unsigned int namelen;
-//    if (untrusted_hdr->namelen > MAX_PATH_LENGTH - 1)
-//        do_exit(ENAMETOOLONG, NULL); /* filename too long so not received at all */
-//    namelen = untrusted_hdr->namelen; /* sanitized above */
-//    if (!read_all_with_crc(0, untrusted_namebuf, namelen))
-//        do_exit(LEGAL_EOF, NULL); // hopefully remote has produced error message
-//    untrusted_namebuf[namelen] = 0;
-//    if (S_ISREG(untrusted_hdr->mode))
-//        process_one_file_reg(untrusted_hdr, untrusted_namebuf);
-//    else if (S_ISLNK(untrusted_hdr->mode))
-//        process_one_file_link(untrusted_hdr, untrusted_namebuf);
-//    else if (S_ISDIR(untrusted_hdr->mode))
-//        process_one_file_dir(untrusted_hdr, untrusted_namebuf);
-//    else
-//        do_exit(EINVAL, untrusted_namebuf);
-//    if (verbose && !S_ISDIR(untrusted_hdr->mode))
-//        fprintf(stderr, "%s\n", untrusted_namebuf);
-//}
-//
-func processFile(hdr *fileHeader, input io.Reader) (string, error) {
-	nLen := hdr.nameLen
-	if nLen > MaxPathLength-1 {
-		return "", fmt.Errorf("file name too long (%d characters)", nLen)
+// visitDir either push the path to the stack, or, if the topmost item
+// is identical to this path, it pops one item from the stack.
+// @return true if this is a new path (push), false if it's the second time around (pop)
+func (r *Receiver) visitDir(path string) bool {
+	if len(r.dirStack) == 0 {
+		r.dirStack = append(r.dirStack, path)
+		return true
 	}
-	nBuf := make([]byte, nLen)
-	if n, _ := input.Read(nBuf); n != int(nLen) {
-		return "", fmt.Errorf("read err, wanted %d, got only %d", nLen, n)
+	if r.dirStack[len(r.dirStack)-1] != path {
+		r.dirStack = append(r.dirStack, path)
+		return true
 	}
-	if nBuf[nLen-1] != 0 {
-		return "", fmt.Errorf("expected NULL-terminated string")
-	}
-	var (
-		name = string(nBuf[:nLen-1])
-		mode = os.FileMode(hdr.mode)
-		err  error
-	)
-	switch {
-	case mode.IsRegular():
-		err = receiveRegularFile(hdr, name, input)
-	case mode.IsDir():
-		err = receiveDir(hdr, name, input)
-	case mode&os.ModeSymlink != 0:
-		err = receiveSymlink(hdr, name, input)
-	default:
-		return "", fmt.Errorf("unknown file mode %d", hdr.mode)
-	}
-	if verbose && len(name) > 0 {
-		log.Printf("%s", name)
-	}
-	return name, err
-
+	r.dirStack = r.dirStack[:len(r.dirStack)-1]
+	return false
 }
 
-//
-//int do_unpack(void)
-//{
-//    struct file_header untrusted_hdr;
-//#ifdef HAVE_SYNCFS
-//    int cwd_fd;
-//    int saved_errno;
-//#endif
-//
-//    total_bytes = total_files = 0;
-//    /* initialize checksum */
-//    crc32_sum = 0;
-//    while (read_all_with_crc(0, &untrusted_hdr, sizeof untrusted_hdr)) {
-//        /* check for end of transfer marker */
-//        if (untrusted_hdr.namelen == 0) {
-//            errno = 0;
-//            break;
-//        }
-//        total_files++;
-//        if (files_limit && total_files > files_limit)
-//            do_exit(EDQUOT, untrusted_namebuf);
-//        process_one_file(&untrusted_hdr);
-//    }
-//
-//#ifdef HAVE_SYNCFS
-//    saved_errno = errno;
-//    cwd_fd = open(".", O_RDONLY);
-//    if (cwd_fd >= 0 && syncfs(cwd_fd) == 0 && close(cwd_fd) == 0)
-//        errno = saved_errno;
-//#else
-//    sync();
-//#endif
-//
-//    send_status_and_crc(errno, untrusted_namebuf);
-//    return errno;
-//}
-//
-func DoUnpack(input io.Reader, out io.Writer) error {
-	totalBytes = 0
-	totalFiles = 0
+func (r *Receiver) processItemMetadata(hdr *fileHeader) error {
+	var err error
+	if hdr.isDir() {
+		err = r.receiveDirMetadata(hdr)
+	} else if hdr.isSymlink() || hdr.isRegular() {
+		err = r.receiveFileMetadata(hdr)
+	} else {
+		return fmt.Errorf("unknown file Mode %x", hdr.Data.Mode)
+	}
+	//if r.verbose && len(hdr.path) > 0 {
+	//	log.Printf("%s", hdr.path)
+	//}
+	return err
+}
+
+func (r *Receiver) ReceiveMetadata() error {
 	var lastName string
 	for {
-		hdr := new(fileHeader)
-		if err := hdr.unMarshallBinary(input); err != nil {
+		hdr, err := unMarshallBinary(r.in)
+		if err != nil {
 			return err
 		}
 		// Check for end of transfer marker
-		if hdr.nameLen == 0 {
+		if hdr.Data.NameLen == 0 {
 			break
 		}
-		totalFiles++
-		if filesLimit > 0 && int(totalFiles) > filesLimit {
-			return fmt.Errorf("number of files (%d) exceeded limit (%d)", totalFiles, filesLimit)
+		r.totalFiles++
+		if r.filesLimit > 0 && int(r.totalFiles) > r.filesLimit {
+			return fmt.Errorf("number of files (%d) exceeded limit (%d)", r.totalFiles, r.filesLimit)
 		}
-		if name, err := processFile(hdr, input); err != nil {
+		if err := r.processItemMetadata(hdr); err != nil {
 			return err
 		} else {
-			lastName = name
+			lastName = hdr.path
 		}
 	}
-	return sendStatusAndCrc(0, lastName, out)
+	return r.sendStatusAndCrc(0, lastName)
 }
 
-//
-//void send_status_and_crc(int code, const char *last_filename) {
-//    struct result_header hdr;
-//    struct result_header_ext hdr_ext;
-//    int saved_errno;
-//
-//    saved_errno = errno;
-//    hdr.error_code = code;
-//    hdr._pad = 0;
-//    hdr.crc32 = crc32_sum;
-//    if (!write_all(1, &hdr, sizeof(hdr)))
-//        perror("write status");
-//    if (last_filename) {
-//        hdr_ext.last_namelen = strlen(last_filename);
-//        if (!write_all(1, &hdr_ext, sizeof(hdr_ext)))
-//            perror("write status ext");
-//        if (!write_all(1, last_filename, hdr_ext.last_namelen))
-//            perror("write last_filename");
-//    }
-//    errno = saved_errno;
-//}
-//
-
-func sendStatusAndCrc(code int, lastFilename string, output io.Writer) error {
-	result := resultHeader{
-		errorCode: uint32(code),
-		pad:       0,
-		crc32:     0,
+func (r *Receiver) ReceiveFullData() error {
+	lastName := ""
+	for _, index := range r.requestList {
+		hdr, err := unMarshallBinary(r.in)
+		if err != nil {
+			return err
+		}
+		if hdr.isRegular() {
+			err = r.receiveRegularFileFullData(hdr)
+		} else if hdr.isSymlink() {
+			err = r.receiveSymlinkFullData(hdr)
+		}
+		if err != nil {
+			return err
+		}
+		lastName = hdr.path
+		log.Printf("Got file %d (%v)", index, lastName)
 	}
-	if err := result.marshallBinary(output); err != nil {
+	return r.sendStatusAndCrc(0, lastName)
+
+}
+
+func (r *Receiver) sendStatusAndCrc(code int, lastFilename string) error {
+	result := resultHeader{
+		ErrorCode: uint32(code),
+		Pad:       0,
+		Crc32:     0xdeadc0de,
+	}
+	if err := result.marshallBinary(r.out); err != nil {
 		return err
 	}
+	if len(lastFilename) == 0 {
+		return nil
+	}
+	extension := &resultHeaderExt{
+		LastNameLen: uint32(len(lastFilename)) + 1,
+		LastName:    lastFilename,
+	}
+	if err := extension.marshallBinary(r.out); err != nil {
+		return fmt.Errorf("failed sending result extension: %v", err)
+	}
+	return nil
+}
 
-	if len(lastFilename) > 0 {
-		extension := resultHeaderExt{
-			lastNameLen: uint32(len(lastFilename)),
-			lastName:    lastFilename,
-		}
-		if err := extension.marshallBinary(output); err != nil {
-			return fmt.Errorf("failed sending result extension: %v", err)
-		}
+func (r *Receiver) RequestFiles() error {
+	log.Printf("Requesting files %d", r.requestList)
+	if err := binary.Write(r.out, binary.LittleEndian, uint32(len(r.requestList))); err != nil {
+		return err
+	}
+	if err := binary.Write(r.out, binary.LittleEndian, r.requestList); err != nil {
+		return err
 	}
 	return nil
 }

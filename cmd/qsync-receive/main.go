@@ -20,9 +20,17 @@ func init() {
 }
 
 func main() {
-	log.Printf("test %v", os.Args[0])
-	if err := packer.DoUnpack(os.Stdin, os.Stdout); err != nil {
-		log.Fatalf("Error during unpack: %v", err)
+	r := packer.NewReceiver(os.Stdin, os.Stdout, true)
+	// Receive directories + metadata
+	if err := r.ReceiveMetadata(); err != nil {
+		log.Fatalf("Error during unpack [1]: %v", err)
 	}
-	os.Exit(0)
+	// Request files
+	if err := r.RequestFiles(); err != nil {
+		log.Fatalf("Error during file request: %v", err)
+	}
+	// Receive data content
+	if err := r.ReceiveFullData(); err != nil {
+		log.Fatalf("Error during unpack [2]: %v", err)
+	}
 }

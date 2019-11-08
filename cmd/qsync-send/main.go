@@ -21,13 +21,10 @@ func main() {
 	if len(os.Args) < 2 {
 		log.Fatal("Error: path not supplied")
 	}
-	fn := os.Args[1]
-	if err := packer.OsWalk(fn, false, os.Stdout); err != nil {
-		log.Fatalf("Error sending: %v", err)
-	}
-
-	if err := packer.WaitForResult(os.Stdin); err != nil {
-		log.Fatalf("Error waiting for response: %v", err)
+	path := os.Args[1]
+	sender := packer.NewSender(os.Stdout, os.Stdin, false)
+	if err := sender.Sync(path); err != nil{
+		log.Fatal(err)
 	}
 	// wait for response
 	log.Print("All done")
