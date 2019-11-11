@@ -11,8 +11,16 @@ I wanted to write it in go-lang because I'm more proficient in go-lang than C,
 and felt more comfortable writing security-critical code using it. 
 
 It turned out that some tricks were not available from within go-lang 
-(see [./cmd/qsync-preloader/README.md](the preloader readme)), but I _think_
+(see [the preloader readme](./cmd/qsync-preloader/README.md)), but I _think_
 the obstacles were overcome in the end. 
+
+Another snag was that it doesn't seem possble to 
+- set permissions on symlinks, nor
+- set mtime/atime on symlinks [ticket](https://github.com/golang/go/issues/3951)
+
+Building it in go-lang made it easy to implement proper testcase support, and
+if someone wants to port it over to C, they can use my implementation as a base. 
+
 
 ## Installation
 
@@ -94,17 +102,17 @@ The `qvm-sync` scheme is roughly similar, but,
 - Instead of sending the file contents, with the first send, we only send the metadata. 
 - As metadata is received, the receiver checks if it already has the file.
   - If it does not have file, add to `requestlist`. 
-  - If it has the file, but filesize differs, add to `requestlist`
-  - If it has the file, but metadata differs, do `crc32` and add to `requestlist'
-- Send back requestlist, which is basically  a list of indexes, and optionally `crc32`.
+  - If it has the file, but metadata differs, add to `requestlist'
+- Send back requestlist, which is only a list of indexes.
 - The initiator then:
-  - For each file in requestlist without `crc`, send over to receiver. 
-  - For each file _with_ `crc`, compare against local, and send over if it differs. 
+  - For each file in requestlist, send over to receiver. 
+ 
+The first version, currently implemented, is pretty dumb. It does not use 
+`crc` on files, but only checks size/mtime/atime for differences. 
 
-For the first version, I'll probably skip `crc`, and just send indexes. That makes
-everything a whole lot simpler, which is particularly beneficial on the `initiator`
-side -- since the `initiator` is not `chroot`:ed, it would be nice to keep the
-input parsing from the remote side to a minimum. 
+It probably makes sense to use crc sums on files, but I'll have to evaluate it 
+in practice a bit first to see how well/bad this dump approach works, before I 
+add that. 
 
 The indices do not count directories, so for syncing the following directory: 
 ```
@@ -116,12 +124,37 @@ a/
 The following data is sent, (with indices in parenthesis -- not actually transmitted over the wire):
 ```
 a       (none)
-a/foo   (1)
+a/foo   (0)
 a/b/    (none)
-a/b/bar (2)
+a/b/bar (1)
 a/b/    (none) // end-dir marker
 a/      (none) // end-dir marker
 EOT     (none) // end-of-transfer marker
 ```
-Note: indices start at `1`, so that `0` can be used to signal `end-of-list`
-And thus, a valid request list can only contain indices `[0,1]`. 
+
+### Notes
+
+#### About the protocol
+
+The protocol is intentionally kept as close to `qvm-copy` as possible, and has 
+avoided any parts that would require multithreading. The entire thing is based on
+four sequential steps, and thus it should be fairly simple to extend `qvm-copy` to 
+implement `qvm-sync`, if one wanted to. 
+
+#### Known issues
+
+The go-lang implementation has a few known bugs: 
+
+- It is unable to set `permissions` on symlinks, 
+- It is unable to sync `mtime/atime` on symlinks,
+
+#### Security
+
+The `qsync-preloader` is meant to be run as a `suid` binary -- i.e. privileged. It
+is does not contain any imports other than the golang base libraries, so no 
+external dependencies of any kind (that goes for all three parts). 
+
+In general, go-lang is memory-safe, and typically crashes rather than continues
+in a bad (insecure) state if corruption occurs. 
+
+The implementation does not make use of golang unsafe pointers.
