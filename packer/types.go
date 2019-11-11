@@ -87,18 +87,20 @@ func (hdr *fileHeader) Eq(other *fileHeader) bool {
 		// Ignore comparing atime/mtime for symlinks, since we
 		// cannot set the times/perms on those when syncing, so they will
 		// basically always yield errors
-		if a, b := hdr.Data.Atime, other.Data.Atime; a != b {
-			errs = append(errs, fmt.Sprintf("Atime %d != %d", a, b))
-		}
-		if a, b := hdr.Data.AtimeNsec, other.Data.AtimeNsec; a != b {
-			errs = append(errs, fmt.Sprintf("AtimeNsec %d != %d", a, b))
-		}
 		if a, b := hdr.Data.Mtime, other.Data.Mtime; a != b {
 			errs = append(errs, fmt.Sprintf("Mtime %d != %d", a, b))
 		}
 		if a, b := hdr.Data.MtimeNsec, other.Data.MtimeNsec; a != b {
 			errs = append(errs, fmt.Sprintf("MtimeNsec %d != %d", a, b))
 		}
+		// Also, ignore Atime differences
+		//if a, b := hdr.Data.Atime, other.Data.Atime; a != b {
+		//	errs = append(errs, fmt.Sprintf("Atime %d != %d", a, b))
+		//}
+		//if a, b := hdr.Data.AtimeNsec, other.Data.AtimeNsec; a != b {
+		//	errs = append(errs, fmt.Sprintf("AtimeNsec %d != %d", a, b))
+		//}
+
 	}
 	if len(errs) != 0 {
 		log.Printf("file diffs for %v: %v", hdr.path, errs)
