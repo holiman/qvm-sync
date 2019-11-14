@@ -100,6 +100,7 @@ The actual sources for this can be found here:
 The `qvm-sync` scheme is roughly similar, but, 
 
 - Instead of sending the file contents, with the first send, we only send the metadata. 
+ - The metadat optionally (and by default) includes `crc32`. 
 - As metadata is received, the receiver checks if it already has the file.
   - If it does not have file, add to `requestlist`. 
   - If it has the file, but metadata differs, add to `requestlist'
@@ -107,12 +108,13 @@ The `qvm-sync` scheme is roughly similar, but,
 - The initiator then:
   - For each file in requestlist, send over to receiver. 
  
-The first version, currently implemented, is pretty dumb. It does not use 
+The first version was pretty dumb. It did not use 
 `crc` on files, but only checks size/mtime/atime for differences. 
 
-It probably makes sense to use crc sums on files, but I'll have to evaluate it 
-in practice a bit first to see how well/bad this dump approach works, before I 
-add that. 
+Now, `crc` has been added, so the initiator places the `crc32` in place of `atime_nsec`
+in the metadata. If/when the full file is sent the second time, that substitution is not made. 
+
+Thus, the same protocol message is reused. 
 
 The indices do not count directories, so for syncing the following directory: 
 ```
@@ -131,6 +133,36 @@ a/b/    (none) // end-dir marker
 a/      (none) // end-dir marker
 EOT     (none) // end-of-transfer marker
 ```
+### Compression
+
+`qvm-sync` can do compression (snappy). Example results, when syncing go-ethereum repository (106 diffs): 
+
+```
+ [qsync-send@work] 2019/11/14 22:30:25 Data sent, raw: 6812458, compressed: 1075905
+...
+ [qsync-send@work] 2019/11/14 22:30:26 Data sent, raw: 22277128, compresed: 5103620
+```
+In the first phase, 
+ - `6.8M` data is sent, but only
+ - `1.1M` compressed. 
+ 
+After the second phase, when the full files have also been sent, 
+- `22.3M` data has been sent, but only
+- `5.1M` compressed. 
+
+For the other direction, where the receiver send data back to the originator, the 
+effect on compression is marginal at best: 
+
+```
+ [qsync-receive-temp-5577006791947779410@dockervm] 2019/11/14 21:30:28 Data sent, raw: 509, compresed: 441
+```
+`509` versus `441` bytes. 
+
+Aside from the actual compression, using Snappy encoding also brings along the benefit of 
+data checksumming. In the original `qvm-copy` protocol, data transferrred is also checksummed, 
+and compared post-transmission. With snappy, we get that included 'under the hood', and 
+don't have to do the checks on the application layer. 
+
 
 ### Notes
 
@@ -158,3 +190,11 @@ In general, go-lang is memory-safe, and typically crashes rather than continues
 in a bad (insecure) state if corruption occurs. 
 
 The implementation does not make use of golang unsafe pointers.
+
+#### Incompatibilities with `qvm-copy`
+
+1. An initial version packet is sent from `initiator` to `receiver`. This packet
+contains info about (desired) verbosity, crc32 usage, compression and version.
+2. Snappy compression added, if so configured. 
+3. There is no application-layer crc to verify data transmission correctness. 
+4. `crc32` on file metadata, in place of `atime_nsec`.

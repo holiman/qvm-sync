@@ -23,8 +23,10 @@ set -e
 
 # This file should be placed in  /usr/bin/qvm-sync
 #
-#
+# Or maybe /usr/local/ should be used, for persistence
+# across restarts
 
+BINDIR=/usr/lib/qubes
 PROGRAM_NAME=${0##*/}
 
 OPERATION_TYPE="copy"
@@ -38,6 +40,6 @@ else
 	export PROGRESS_TYPE=console
 fi
 
-echo "/usr/lib/qubes/qrexec-client-vm "@default" qubes.Filesync /usr/lib/qubes/qsync-send \"$@\""
+echo "/usr/lib/qubes/qrexec-client-vm "@default" qubes.Filesync $BINDIR/qsync-send \"$@\""
 
-/usr/lib/qubes/qrexec-client-vm "@default" qubes.Filesync /usr/lib/qubes/qsync-send "$@"
+/usr/lib/qubes/qrexec-client-vm "@default" qubes.Filesync $BINDIR/qsync-send "$@"

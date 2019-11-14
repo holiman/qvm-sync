@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -26,10 +28,10 @@ qvm-sync]$ /usr/lib/qubes/qfile-agent testdata/afile.txt | xxd
 func TestPackFile(t *testing.T) {
 	exp, _ := hex.DecodeString("0a000000b48100000c00000000000000f781c05d80b86723cd81c05dc03d751e6166696c652e7478740068656c6c6f20776f726c640a0000000000000000000000000000000000000000000000000000000000000000")
 	buf := bytes.NewBuffer(nil)
-	r := NewSender(buf, nil, true)
+	r, _ := NewSender(buf, nil, nil)
 	name := "./testdata/afile.txt"
 
-	if err := r.OsWalk(name); err != nil {
+	if err := r.transmitDirectory(name); err != nil {
 		t.Fatal(err)
 	}
 	got := buf.Bytes()
@@ -61,9 +63,9 @@ func TestPackSymlink(t *testing.T) {
 
 	name := "./testdata/alink.foo"
 	buf := bytes.NewBuffer(nil)
-	r := NewSender(buf, nil, true)
+	r, _ := NewSender(buf, nil, nil)
 
-	if err := r.OsWalk(name); err != nil {
+	if err := r.transmitDirectory(name); err != nil {
 		t.Fatal(err)
 	}
 	got := buf.Bytes()
@@ -122,8 +124,8 @@ func TestWalk(t *testing.T) {
 	exp, _ := hex.DecodeString(exps)
 	name := "./testdata"
 	buf := bytes.NewBuffer(nil)
-	r := NewSender(buf, nil, true)
-	r.OsWalk(name)
+	r, _ := NewSender(buf, nil, nil)
+	r.transmitDirectory(name)
 
 	got := buf.Bytes()
 	if !bytes.Equal(got, exp) {
@@ -132,13 +134,13 @@ func TestWalk(t *testing.T) {
 	fmt.Printf("%x\n", got)
 }
 
-func TestMarshalUnMarshal(t *testing.T){
+func TestMarshalUnMarshal(t *testing.T) {
 
-	var fromBin = func(data []byte) (*fileHeader, error){
+	var fromBin = func(data []byte) (*fileHeader, error) {
 		r := bytes.NewReader(data)
 		return unMarshallBinary(r)
 	}
-	var toBin = func(hdr *fileHeader) ([]byte, error){
+	var toBin = func(hdr *fileHeader) ([]byte, error) {
 		outb := bytes.NewBuffer(nil)
 		err := hdr.marshallBinary(outb)
 		return outb.Bytes(), err
@@ -149,88 +151,196 @@ func TestMarshalUnMarshal(t *testing.T){
 		in := make([]byte, 32)
 		rand.Read(in)
 		// set name length explicitly to zero
-		copy(in[0:], []byte{0,0,0,0})
-		hdr,err  := fromBin(in)
-		if err != nil{
+		copy(in[0:], []byte{0, 0, 0, 0})
+		hdr, err := fromBin(in)
+		if err != nil {
 			t.Fatal(err)
 		}
 		out, err := toBin(hdr)
-		if err != nil{
+		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(out, in){
+		if !bytes.Equal(out, in) {
 			t.Fatalf("input: \n%x\n != output:\n%x\n", in, out)
 		}
 	}
 
 	{
 		hdr.path = "abcde"
-		hdr.Data.NameLen = uint32(len(hdr.path)+1)
+		hdr.Data.NameLen = uint32(len(hdr.path) + 1)
 		out, err := toBin(&hdr)
-		if err != nil{
+		if err != nil {
 			t.Fatal(err)
 		}
 
-		hdr2,err  := fromBin(out)
-		if err != nil{
+		hdr2, err := fromBin(out)
+		if err != nil {
 			t.Fatal(err)
 		}
 
-		if err != nil{
+		if err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(&hdr, hdr2){
+		if !reflect.DeepEqual(&hdr, hdr2) {
 			t.Fatalf("err: %v != %v", hdr, hdr2)
 		}
 	}
 }
 
-
-func TestEntireDirectory(t *testing.T){
+func TestEntireDirectory(t *testing.T) {
 
 	pipeOneIn, pipeOneOut := io.Pipe()
 	pipeTwoIn, pipeTwoOut := io.Pipe()
 
 	// Resolve the syncsource before we chdir
 	syncSource, err := filepath.Abs("./testdata")
-	if err != nil{
+	//syncSource, err := filepath.Abs("/home/user/go/src/github.com/ethereum/go-ethereum")
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := os.Chdir("/tmp/"); err != nil{
+	if err := os.Chdir("/tmp/"); err != nil {
 		t.Fatal(err)
 	}
-
-	var send = func(){
+	opts := &Options{
+		Compression: CompressionSnappy,
+		//Compression:    CompressionOff,
+		CrcUsage:       FileCrcAtimeNsecMetadata,
+		Verbosity:      3,
+		IgnoreSymlinks: false,
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var send = func() {
+		defer wg.Done()
 		defer pipeOneOut.Close()
-		sender := NewSender(pipeOneOut, pipeTwoIn, false)
-		if err := sender.Sync(syncSource); err != nil{
+		sender, err := NewSender(pipeOneOut, pipeTwoIn, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sender.Sync(syncSource); err != nil {
 			t.Fatal(err)
 		}
 		// wait for response
 		log.Print("Sender all done")
 	}
 
-	var recv = func(){
+	var recv = func() {
 		defer pipeTwoOut.Close()
 
-		r := NewReceiver(pipeOneIn, pipeTwoOut, false)
+		r, err := NewReceiver(pipeOneIn, pipeTwoOut)
+		if err != nil {
+			t.Fatal(err)
+		}
 		// Receive directories + metadata
-		if err := r.ReceiveMetadata(); err != nil {
-			t.Fatalf("Error during unpack [1]: %v", err)
-		}
-		// Request files
-		if err := r.RequestFiles(); err != nil {
-			t.Fatalf("Error during file request: %v", err)
-		}
-		// Receive Data content
-		if err := r.ReceiveFullData(); err != nil {
-			t.Fatalf("Error during unpack [2]: %v", err)
+		if err := r.Sync(); err != nil {
+			t.Fatalf("Error during sync: %v", err)
 		}
 		log.Printf("Receiver all done")
 	}
 
 	go send()
 	recv()
+	wg.Wait()
+}
+
+
+func testOsWalk(dirname string) error {
+
+	absPath, _ := filepath.Abs(filepath.Clean(dirname))
+	root, path := filepath.Split(absPath)
+	stat, err := os.Lstat(absPath)
+	if err != nil {
+		return err
+	}
+	// Check that it actually is a directory
+	if !stat.IsDir() {
+		return fmt.Errorf("%v is not a directory", dirname)
+	}
+	if err := testOsWalkInternal(root, path, stat); err != nil {
+		return err
+	}
+	return err
+}
+
+// With crc:
+//BenchmarkCrcFilesBuf/test-32-6         	       1	1033402134 ns/op
+//BenchmarkCrcFilesBuf/test-64-6         	       2	 884616798 ns/op // 884 ms-- sane choice
+//BenchmarkCrcFilesBuf/test-128-6        	       2	 869347812 ns/op
+//BenchmarkCrcFilesBuf/test-1M-6         	       2	 873511816 ns/op
+
+// Without crc:
+//BenchmarkCrcFilesBuf/test-32-6         	      10	 161151702 ns/op // 161 ms
+//BenchmarkCrcFilesBuf/test-64-6         	      10	 161965409 ns/op
+//BenchmarkCrcFilesBuf/test-128-6        	      10	 170212225 ns/op
+//BenchmarkCrcFilesBuf/test-1M-6         	      10	 166505231 ns/op
+
+func testOsWalkInternal(root, path string, stat os.FileInfo) error {
+	var (
+		cur = filepath.Join(root, path)
+	)
+	_, err := CrcFile(cur, stat)
+	if err != nil {
+		return err
+	}
+	if stat.IsDir() {
+		files, err := ioutil.ReadDir(cur)
+		if err != nil {
+			return fmt.Errorf("read dir err on %v: %v", cur, err)
+		}
+		for _, finfo := range files {
+			fName := filepath.Join(path, finfo.Name())
+			if err := testOsWalkInternal(root, fName, finfo); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func TestCrcFiles(t *testing.T) {
+
+	err := testOsWalk("/home/user/go/src/github.com/ethereum/go-ethereum")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func BenchmarkCrcFiles(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		testOsWalk("/home/user/go/src/github.com/ethereum/go-ethereum")
+	}
+}
+
+func BenchmarkCrcFilesBuf(b *testing.B) {
+	b.Run("test-32", func(b *testing.B) {
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			testOsWalk("/home/user/go/src/github.com/ethereum/go-ethereum")
+		}
+	})
+
+	b.Run("test-64", func(b *testing.B) {
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			testOsWalk("/home/user/go/src/github.com/ethereum/go-ethereum")
+		}
+	})
+	b.Run("test-128", func(b *testing.B) {
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			testOsWalk("/home/user/go/src/github.com/ethereum/go-ethereum")
+		}
+	})
+	b.Run("test-1M", func(b *testing.B) {
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			testOsWalk("/home/user/go/src/github.com/ethereum/go-ethereum")
+		}
+	})
 
 }

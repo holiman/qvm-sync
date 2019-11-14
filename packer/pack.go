@@ -3,6 +3,7 @@ package packer
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/golang/snappy"
 	"io"
 	"io/ioutil"
 	"log"
@@ -11,33 +12,67 @@ import (
 )
 
 type Sender struct {
-	out            io.Writer
-	in             io.Reader
-	ignoreSymlinks bool
-	sendList       []string
-	root           string
+	out      BufferedWriter
+	in       io.Reader
+	sendList []string
+	root     string
+
+	// Options
+	opts *Options
+
+	// stats
+	rawCounter  *MeteredWriter
+	snapCounter *MeteredWriter
 }
 
 const regularOrSymlink = os.ModeDir | os.ModeNamedPipe | os.ModeSocket |
 	os.ModeDevice | os.ModeIrregular
 
-func NewSender(out io.Writer, in io.Reader, ignoreSymlinks bool) *Sender {
-	return &Sender{out: out, in: in, ignoreSymlinks: ignoreSymlinks}
+func NewSender(out io.Writer, in io.Reader, opts *Options) (*Sender, error) {
+	if opts == nil {
+		opts = DefaultOptions
+	}
+	if opts.CrcUsage > FileCrcAtimeNsecMetadata {
+		return nil, fmt.Errorf("Unsupported crc usage: %d", opts.CrcUsage)
+	}
+	if opts.Compression > CompressionSnappy {
+		return nil, fmt.Errorf("Unsupported compression format %d", opts.Compression)
+	}
+	var sender = &Sender{
+		opts: opts,
+		out:  NewConfigurableWriter(opts.Compression == CompressionSnappy, out),
+	}
+	// We still have the un-modified 'out', and can send the first packet
+	// without compression
+	v := newVersionHeader(opts.Compression, opts.CrcUsage, opts.Verbosity)
+	if err := v.marshallBinary(out); err != nil {
+		return nil, err
+	}
+	if opts.Compression == CompressionSnappy {
+		in = snappy.NewReader(in)
+	}
+	sender.in = in
+	return sender, nil
 }
 
 func (s *Sender) Sync(path string) error {
-	if err := s.OsWalk(path); err != nil {
+	if err := s.transmitDirectory(path); err != nil {
 		return fmt.Errorf("phase 0 send error: %v", err)
 	}
-
-	if err := s.WaitForResult(); err != nil {
+	if err := s.waitForResult(); err != nil {
 		return fmt.Errorf("phase 1 wait error: %v", err)
 	}
-	if err := s.HandleFileList(); err != nil {
+	if err := s.handleFileList(); err != nil {
 		return fmt.Errorf("phase 2 list error: %v", err)
 	}
-	if err := s.WaitForResult(); err != nil {
+	if err := s.waitForResult(); err != nil {
 		return fmt.Errorf("phase 3 wait error: %v", err)
+	}
+	if s.opts.Verbosity >= 3 {
+		if cm, ok := s.out.(*ConfigurableWriter); ok {
+			r, c := cm.Stats()
+			log.Printf("Data sent, raw: %d, compresed: %d", r, c)
+		}
 	}
 	return nil
 }
@@ -46,6 +81,19 @@ func (s *Sender) Sync(path string) error {
 // it remembers the paths of each file sent
 func (s *Sender) sendItemMetadata(path string, info os.FileInfo) error {
 	header := newFileHeaderFromStat(path, info)
+
+	// Possibly replace atimensec with crc32
+	if header.isRegular() {
+		fullPath := filepath.Join(s.root, path)
+		if s.opts.CrcUsage == FileCrcAtimeNsec ||
+			s.opts.CrcUsage == FileCrcAtimeNsecMetadata {
+			crc, err := CrcFile(fullPath, info)
+			if err != nil {
+				return fmt.Errorf("crc failed: %v", err)
+			}
+			header.Data.AtimeNsec = crc
+		}
+	}
 	header.marshallBinary(s.out)
 	if info.Mode()&regularOrSymlink == 0 {
 		// Files and symlinks can be requested later
@@ -63,17 +111,27 @@ func (s *Sender) sendItem(index uint32) error {
 	}
 	var (
 		filename  = s.sendList[index]
-		info, err = os.Lstat(filepath.Join(s.root, filename))
+		path      = filepath.Join(s.root, filename)
+		info, err = os.Lstat(path)
 	)
 	if err != nil {
 		return fmt.Errorf("file %v no longer available: %v", filename, err)
 	}
-	log.Printf("Sending file %v", filename)
+	if s.opts.Verbosity >= 4 {
+		log.Printf("Sending file %v", filename)
+	}
 	header := newFileHeaderFromStat(filename, info)
+	// Possibly replace atimensec with crc32
+	if header.isRegular() && s.opts.CrcUsage == FileCrcAtimeNsec {
+		crc, err := CrcFile(path, info)
+		if err != nil {
+			return err
+		}
+		header.Data.AtimeNsec = crc
+	}
 	if err := header.marshallBinary(s.out); err != nil {
 		return err
 	}
-
 	if info.Mode()&os.ModeSymlink != 0 {
 		var data string
 		data, err = os.Readlink(filepath.Join(s.root, filename))
@@ -94,12 +152,14 @@ func (s *Sender) sendItem(index uint32) error {
 	return err
 }
 
-// OsWalk resolves the given dirname to a directory, and syncs that directory
-func (s *Sender) OsWalk(dirname string) error {
+// transmitDirectory resolves the given dirname to a directory, and syncs that directory
+func (s *Sender) transmitDirectory(dirname string) error {
 
 	absPath, _ := filepath.Abs(filepath.Clean(dirname))
 	root, path := filepath.Split(absPath)
-	log.Printf("Root: %v, sync dir: %v", root, path)
+	if s.opts.Verbosity >= 3 {
+		log.Printf("Root: %v, sync dir: %v", root, path)
+	}
 	stat, err := os.Lstat(absPath)
 	if err != nil {
 		return err
@@ -113,16 +173,30 @@ func (s *Sender) OsWalk(dirname string) error {
 		return err
 	}
 	// send ending
-	_, err = s.out.Write(make([]byte, 32))
-	return err
+	if s.opts.Verbosity >= 5 {
+		log.Print("Sending EOD (2)")
+	}
+	if _, err = s.out.Write(make([]byte, 32)); err != nil {
+		return err
+	}
+	if err := s.out.Flush(); err != nil {
+		return err
+	}
+	if cm, ok := s.out.(*ConfigurableWriter); ok {
+		r, c := cm.Stats()
+		log.Printf("Data sent, raw: %d, compressed: %d", r, c)
+	}
+	return nil
 }
 
 func (s *Sender) osWalk(path string, stat os.FileInfo) error {
 
-	if s.ignoreSymlinks && (stat.Mode()&os.ModeSymlink != 0) {
+	if s.opts.IgnoreSymlinks && (stat.Mode()&os.ModeSymlink != 0) {
 		return nil
 	}
-	log.Printf("Sending metadata for %v", path)
+	if s.opts.Verbosity >= 5 {
+		log.Printf("Sending metadata for %v", path)
+	}
 	if err := s.sendItemMetadata(path, stat); err != nil {
 		return err
 	}
@@ -140,6 +214,9 @@ func (s *Sender) osWalk(path string, stat os.FileInfo) error {
 		}
 	}
 	// resend directory info
+	if s.opts.Verbosity >= 5 {
+		log.Printf("Sending metadata (2) for %v", path)
+	}
 	stat, _ = os.Lstat(filepath.Join(s.root, path))
 	if err = s.sendItemMetadata(path, stat); err != nil {
 		return err
@@ -147,7 +224,7 @@ func (s *Sender) osWalk(path string, stat os.FileInfo) error {
 	return nil
 }
 
-func (s *Sender) WaitForResult() error {
+func (s *Sender) waitForResult() error {
 	hdr := new(resultHeader)
 	if err := hdr.unMarshallBinary(s.in); err != nil {
 		return err
@@ -156,21 +233,16 @@ func (s *Sender) WaitForResult() error {
 	if err := hdrExt.unMarshallBinary(s.in); err != nil {
 		return err
 	}
-	switch hdr.ErrorCode {
-	case 17: // EEXIST:
-		return fmt.Errorf("A file named %s already exists in QubesIncoming dir", hdrExt.LastName)
-	case 22: // EINVAL
-		return fmt.Errorf("File copy: Corrupted Data from packer (last file %v)", hdrExt.LastName)
-	case 0:
-		break
-	default:
-		return fmt.Errorf("File copy: error code %v , %v", hdr.ErrorCode, hdrExt.LastName)
+	if hdr.ErrorCode != 0{
+		return fmt.Errorf("sync error, code: %v , last file: %v", hdr.ErrorCode, hdrExt.LastName)
 	}
-	log.Printf("Crc [%x] checking ignored (todo!). Last file was %v", hdr.Crc32, hdrExt.LastName)
+	if s.opts.Verbosity >= 3 {
+		log.Printf("Got result ACK, last file %v",  hdrExt.LastName)
+	}
 	return nil
 }
 
-func (s *Sender) HandleFileList() error {
+func (s *Sender) handleFileList() error {
 
 	var listLen uint32
 	if err := binary.Read(s.in, binary.LittleEndian, &listLen); err != nil {
@@ -183,13 +255,14 @@ func (s *Sender) HandleFileList() error {
 	if err := binary.Read(s.in, binary.LittleEndian, &list); err != nil {
 		return err
 	}
-	log.Printf("Got list, %d items requested", len(list))
-
+	if s.opts.Verbosity >= 3 {
+		log.Printf("Got list, %d items requested", len(list))
+	}
 	for _, index := range list {
 		// index starts at 1
 		if err := s.sendItem(index); err != nil {
 			return err
 		}
 	}
-	return nil
+	return s.out.Flush()
 }

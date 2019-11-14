@@ -3,11 +3,11 @@ package packer
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/golang/snappy"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
-	"time"
 )
 
 const (
@@ -16,35 +16,11 @@ const (
 	MaxTransfer = 1e12
 )
 
-// fixTimesAndPerms set permissions on a the given file/directory according to
-// the fileHeader
-//
-// Setting permissions doesn't work on symlinks. Chmod docs:
-//
-// > If the file is a symbolic link, it changes the mode of the link's target.
-//
-// And similarly, it's not possible to do ChTimes on a symlink, as golang will always
-// resolve the symlinks, see https://github.com/golang/go/issues/3951
-//
-// - Invoking os.Chtimes on a symlink that resolves to some existing file will
-//   in actuality change the other file.
-// - Invoking os.Chtimes on a symlink that doesn't resolve to an existing file at
-//   all, will return an error (no such file or directory).
-func fixTimesAndPerms(hdr *fileHeader) error {
-	if err := os.Chmod(hdr.path, os.FileMode(hdr.Data.Mode&07777)); err != nil {
-		return err
-	}
-	atime := time.Unix(int64(hdr.Data.Atime), int64(hdr.Data.AtimeNsec))
-	mtime := time.Unix(int64(hdr.Data.Mtime), int64(hdr.Data.MtimeNsec))
-	return os.Chtimes(hdr.path, atime, mtime)
-}
-
 type Receiver struct {
 	in  io.Reader
-	out io.Writer
+	out BufferedWriter
 
 	useTempFile bool // Should it unpack into tempfiles first?
-	verbose     bool // verbose output
 
 	totalBytes uint64 // counter for total bytes received
 	totalFiles uint64 // counter for total files received
@@ -60,17 +36,64 @@ type Receiver struct {
 	// place to store stuff in. Defaults to empty string, as we're normally
 	// root-jailed, but is used for testing
 	root string
+
+	opts Options
 }
 
 // NewReceiver creates a new receiver
-func NewReceiver(in io.Reader, out io.Writer, verbose bool) *Receiver {
+func NewReceiver(in io.Reader, out io.Writer) (*Receiver, error) {
+	v := versionHeader{}
+	if err := binary.Read(in, binary.LittleEndian, &v); err != nil {
+		return nil, err
+	}
+	if v.Version != 0 {
+		return nil, fmt.Errorf("unsupported version: %d", v.Version)
+	}
+	opts := Options{
+		Verbosity:   int(v.Verbosity),
+		CrcUsage:    int(v.FileCrcUsage),
+		Compression: int(v.Compression),
+	}
+	if opts.Compression > CompressionSnappy {
+		return nil, fmt.Errorf("Unsupported compression format %d", opts.Compression)
+	}
+	if opts.Compression == CompressionSnappy {
+		in = snappy.NewReader(in)
+	}
+	if opts.Verbosity >= 3 {
+		log.Printf("protocol version: %d, verbosity %d, snappy: %v, crc: %d",
+			v.Version,opts.Verbosity, opts.Compression != 0, opts.CrcUsage)
+	}
 	return &Receiver{
 		in:          in,
-		out:         out,
+		out:         NewConfigurableWriter(opts.Compression == CompressionSnappy, out),
 		filesLimit:  -1,
 		useTempFile: true,
-		verbose:     verbose,
+		opts:        opts,
+	}, nil
+}
+
+func (r *Receiver) Sync() error {
+	// Receive directories + metadata
+	if err := r.receiveMetadata(); err != nil {
+		return fmt.Errorf("Error during phase 0 receive : %v", err)
 	}
+	// Request files
+	if err := r.requestFiles(); err != nil {
+		return fmt.Errorf("Error during phase 2 file request: %v", err)
+	}
+	// Receive data content
+	if err := r.receiveFullData(); err != nil {
+		return fmt.Errorf("Error during file reception: %v", err)
+	}
+	if r.opts.Verbosity >= 3 {
+		if cm, ok := r.out.(*ConfigurableWriter); ok {
+			r, c := cm.Stats()
+			log.Printf("Data sent, raw: %d, compresed: %d", r, c)
+		}
+	}
+
+	return nil
 }
 
 // request schedules a certain index for later retrieval
@@ -105,8 +128,25 @@ func (r *Receiver) receiveFileMetadata(hdr *fileHeader) error {
 		return nil
 	}
 	localFile := newFileHeaderFromStat(hdr.path, localFileInfo)
-	if !localFile.Eq(hdr) {
+	if diff := localFile.Diff(hdr); len(diff) > 0 {
+		if r.opts.Verbosity >= 4 {
+			log.Printf("file diffs for %v: %v", hdr.path, diff)
+		}
 		r.request(r.index)
+	}
+	if r.opts.CrcUsage == FileCrcAtimeNsecMetadata ||
+		r.opts.CrcUsage == FileCrcAtimeNsec {
+		crc, err := CrcFile(hdr.path, localFileInfo)
+		if err != nil {
+			return err
+		}
+		if crc != hdr.Data.AtimeNsec {
+			if r.opts.Verbosity >= 3 {
+				log.Printf("crc diff on %v (local %d, remote %d)",
+					hdr.path, crc, hdr.Data.AtimeNsec)
+			}
+			r.request(r.index)
+		}
 	}
 	return nil
 }
@@ -137,10 +177,12 @@ func (r *Receiver) receiveDirMetadata(header *fileHeader) error {
 		// Dir did not exist (or was removed)
 		return os.Mkdir(header.path, 0700)
 	}
-	log.Printf("Fixing perms for %v", header.path)
+	if r.opts.Verbosity >= 5 {
+		log.Printf("Fixing perms for %v", header.path)
+	}
 	// second visit
 	// we fix the perms after we're done with it
-	return fixTimesAndPerms(header)
+	return header.fixTimesAndPerms()
 }
 
 func (r *Receiver) receiveRegularFileFullData(hdr *fileHeader) error {
@@ -153,7 +195,6 @@ func (r *Receiver) receiveRegularFileFullData(hdr *fileHeader) error {
 		err   error
 	)
 	if !r.useTempFile {
-		// TODO, handle if file already exist
 		if fdOut, err = os.OpenFile(hdr.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0); err != nil {
 			return err
 		}
@@ -164,7 +205,9 @@ func (r *Receiver) receiveRegularFileFullData(hdr *fileHeader) error {
 			return err
 		}
 		fdOut.Close()
-		fixTimesAndPerms(hdr)
+		if err := hdr.fixTimesAndPerms(); err != nil {
+			return err
+		}
 	}
 	// Create tempfile
 	if fdOut, err = ioutil.TempFile(".", "qvm-*"); err != nil {
@@ -182,7 +225,7 @@ func (r *Receiver) receiveRegularFileFullData(hdr *fileHeader) error {
 	if err := os.Link(fdOut.Name(), hdr.path); err != nil {
 		return fmt.Errorf("unable to link file : %v", err)
 	}
-	return fixTimesAndPerms(hdr)
+	return hdr.fixTimesAndPerms()
 }
 
 func (r *Receiver) receiveSymlinkFullData(hdr *fileHeader) error {
@@ -234,13 +277,10 @@ func (r *Receiver) processItemMetadata(hdr *fileHeader) error {
 	} else {
 		return fmt.Errorf("unknown file Mode %x", hdr.Data.Mode)
 	}
-	//if r.verbose && len(hdr.path) > 0 {
-	//	log.Printf("%s", hdr.path)
-	//}
 	return err
 }
 
-func (r *Receiver) ReceiveMetadata() error {
+func (r *Receiver) receiveMetadata() error {
 	var lastName string
 	for {
 		hdr, err := unMarshallBinary(r.in)
@@ -261,11 +301,14 @@ func (r *Receiver) ReceiveMetadata() error {
 			lastName = hdr.path
 		}
 	}
-	return r.sendStatusAndCrc(0, lastName)
+	if err := r.sendStatusAndCrc(0, lastName); err != nil {
+		return err
+	}
+	return r.out.Flush()
 }
 
-func (r *Receiver) ReceiveFullData() error {
-	lastName := ""
+func (r *Receiver) receiveFullData() error {
+	var lastName string
 	for _, index := range r.requestList {
 		hdr, err := unMarshallBinary(r.in)
 		if err != nil {
@@ -280,17 +323,19 @@ func (r *Receiver) ReceiveFullData() error {
 			return err
 		}
 		lastName = hdr.path
-		log.Printf("Got file %d (%v)", index, lastName)
+		if r.opts.Verbosity >= 4 {
+			log.Printf("Got file %d (%v)", index, lastName)
+		}
 	}
-	return r.sendStatusAndCrc(0, lastName)
-
+	if err := r.sendStatusAndCrc(0, lastName); err != nil {
+		return err
+	}
+	return r.out.Flush()
 }
 
 func (r *Receiver) sendStatusAndCrc(code int, lastFilename string) error {
-	result := resultHeader{
+	result := &resultHeader{
 		ErrorCode: uint32(code),
-		Pad:       0,
-		Crc32:     0xdeadc0de,
 	}
 	if err := result.marshallBinary(r.out); err != nil {
 		return err
@@ -308,13 +353,15 @@ func (r *Receiver) sendStatusAndCrc(code int, lastFilename string) error {
 	return nil
 }
 
-func (r *Receiver) RequestFiles() error {
-	log.Printf("Requesting files %d", r.requestList)
+func (r *Receiver) requestFiles() error {
+	if r.opts.Verbosity >= 3 {
+		log.Printf("Requesting files %d", r.requestList)
+	}
 	if err := binary.Write(r.out, binary.LittleEndian, uint32(len(r.requestList))); err != nil {
 		return err
 	}
 	if err := binary.Write(r.out, binary.LittleEndian, r.requestList); err != nil {
 		return err
 	}
-	return nil
+	return r.out.Flush()
 }
