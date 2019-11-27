@@ -32,14 +32,7 @@ PROGRAM_NAME=${0##*/}
 OPERATION_TYPE="copy"
 TARGET_TYPE="default"
 
+cmd="$BINDIR/qrexec-client-vm "@default" qubes.Filesync $BINDIR/qsync-send \"$@\""
 
-if [ "$1" = "--without-progress" ] ; then
-	export PROGRESS_TYPE=none
-	shift
-else
-	export PROGRESS_TYPE=console
-fi
-
-echo "/usr/lib/qubes/qrexec-client-vm "@default" qubes.Filesync $BINDIR/qsync-send \"$@\""
-
-/usr/lib/qubes/qrexec-client-vm "@default" qubes.Filesync $BINDIR/qsync-send "$@"
+echo "$cmd"
+$cmd

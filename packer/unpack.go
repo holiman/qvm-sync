@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -28,8 +29,9 @@ type Receiver struct {
 	filesLimit int    // a limit on the number of files to receive
 	byteLimit  uint64 // limit on the number of bytes to receive
 
-	index       uint32   // index count,for requesting
-	requestList []uint32 // list of files (indexes) to request
+	index       uint32              // index count,for requesting
+	requestList []uint32            // list of files (indexes) to request
+	toDelete    map[string]struct{} // list of local files to delete
 
 	dirStack []string // stack of directories we visit/create
 
@@ -62,7 +64,7 @@ func NewReceiver(in io.Reader, out io.Writer) (*Receiver, error) {
 	}
 	if opts.Verbosity >= 3 {
 		log.Printf("protocol version: %d, verbosity %d, snappy: %v, crc: %d",
-			v.Version,opts.Verbosity, opts.Compression != 0, opts.CrcUsage)
+			v.Version, opts.Verbosity, opts.Compression != 0, opts.CrcUsage)
 	}
 	return &Receiver{
 		in:          in,
@@ -70,6 +72,7 @@ func NewReceiver(in io.Reader, out io.Writer) (*Receiver, error) {
 		filesLimit:  -1,
 		useTempFile: true,
 		opts:        opts,
+		toDelete:    make(map[string]struct{}),
 	}, nil
 }
 
@@ -92,7 +95,28 @@ func (r *Receiver) Sync() error {
 			log.Printf("Data sent, raw: %d, compresed: %d", r, c)
 		}
 	}
-
+	for f, _ := range r.toDelete {
+		info, err := os.Lstat(f)
+		if err != nil {
+			log.Printf("Error during deletion: %v", err)
+			continue
+		}
+		if info.IsDir() {
+			os.RemoveAll(f)
+			if r.opts.Verbosity >= 4 {
+				log.Printf("Removed directory %v", f)
+			}
+		} else {
+			if err := os.Remove(f); err != nil {
+				if r.opts.Verbosity > 0 {
+					log.Printf("Failed to delete %v: %v", f, err)
+				}
+			}
+			if r.opts.Verbosity >= 4 {
+				log.Printf("Removed %v", f)
+			}
+		}
+	}
 	return nil
 }
 
@@ -162,9 +186,11 @@ func (r *Receiver) receiveDirMetadata(header *fileHeader) error {
 	// can consult it to find it if
 	// 1. we're now backing out of a dir, or,
 	// 2. We're visiting/creating one for the first time
-	if r.visitDir(header.path) {
-		//abs, _ := filepath.Abs(header.path)
-		// first visit
+	if r.visitDir(header.path) { // first visit
+		// remember the files that were there
+		if err := r.snapshotFiles(header.path, false); err != nil {
+			return err
+		}
 		if stat, err := os.Lstat(header.path); err == nil {
 			// directory already exists -- make sure it's a dir -- otherwise delete
 			if stat.IsDir() {
@@ -280,8 +306,55 @@ func (r *Receiver) processItemMetadata(hdr *fileHeader) error {
 	return err
 }
 
+func (r *Receiver) snapshotFiles(dir string, checkRoot bool) error {
+	// Build up the list of existing files (on the current directory level)
+	files, err := ioutil.ReadDir(dir)
+	if err != nil && os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		fullPath, err := filepath.Abs(filepath.Join(dir, f.Name()))
+		if err != nil {
+			return err
+		}
+		r.toDelete[fullPath] = struct{}{}
+	}
+	// We are supposed to be chrooted, and therefore unable to actually
+	// delete files arbitrarily. However, better safe than sorry, so this
+	// program will simply throw an error if it "looks like" we're not in a
+	// chroot but in an actual root
+	if checkRoot {
+		blackList := []string{
+			"bin", "boot", "dev", "etc", "home", "lost+found",
+			"media", "mnt", "opt", "proc", "root",
+			"sbin", "srv", "sys", "usr", "var",
+		}
+		for _, nope := range blackList {
+			if _, exist := r.toDelete[filepath.Join(dir, nope)]; exist {
+				return fmt.Errorf("file %v in receiver root, bailing out", nope)
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Receiver) removeSnapshot(path string) error {
+	fullpath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	delete(r.toDelete, fullpath)
+	return nil
+}
+
 func (r *Receiver) receiveMetadata() error {
 	var lastName string
+	if err := r.snapshotFiles("./", true); err != nil {
+		return fmt.Errorf("snapshot failed: %v", err)
+	}
 	for {
 		hdr, err := unMarshallBinary(r.in)
 		if err != nil {
@@ -295,6 +368,7 @@ func (r *Receiver) receiveMetadata() error {
 		if r.filesLimit > 0 && int(r.totalFiles) > r.filesLimit {
 			return fmt.Errorf("number of files (%d) exceeded limit (%d)", r.totalFiles, r.filesLimit)
 		}
+		r.removeSnapshot(hdr.path)
 		if err := r.processItemMetadata(hdr); err != nil {
 			return err
 		} else {

@@ -188,25 +188,48 @@ func TestMarshalUnMarshal(t *testing.T) {
 }
 
 func TestEntireDirectory(t *testing.T) {
+	// Shoot over the /foobar dir
+	testEntireDirectory(t, "./testdata/foobar")
+	// And then the /foobar2 dir, where some files
+	// are now dirs, and vice versa
+
+	// but need to swap them first
+	os.Rename("./testdata/foobar","./testdata/foobarOld")
+	os.Rename("./testdata/foobar2","./testdata/foobar")
+	defer func(){
+		os.Rename("./testdata/foobar","./testdata/foobar2")
+		os.Rename("./testdata/foobarOld","./testdata/foobar")
+	}()
+
+	testEntireDirectory(t, "./testdata/foobar2")
+
+
+}
+func testEntireDirectory(t *testing.T, path string) {
 
 	pipeOneIn, pipeOneOut := io.Pipe()
 	pipeTwoIn, pipeTwoOut := io.Pipe()
 
 	// Resolve the syncsource before we chdir
-	syncSource, err := filepath.Abs("./testdata")
-	//syncSource, err := filepath.Abs("/home/user/go/src/github.com/ethereum/go-ethereum")
+	syncSource, err := filepath.Abs(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if err := os.Chdir("/tmp/"); err != nil {
+	cwd, err := os.Getwd()
+	if err != nil{
 		t.Fatal(err)
 	}
+	os.MkdirAll("/tmp/packtest", 0755)
+	if err := os.Chdir("/tmp/packtest/"); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+
 	opts := &Options{
 		Compression: CompressionSnappy,
 		//Compression:    CompressionOff,
 		CrcUsage:       FileCrcAtimeNsecMetadata,
-		Verbosity:      3,
+		Verbosity:      4,
 		IgnoreSymlinks: false,
 	}
 	var wg sync.WaitGroup

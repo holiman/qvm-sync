@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # directory where qvm-sync (bash script_ lives
-SYNCDIR=/usr/bin
+SYNCDIR=/usr/local/bin
 
 # directory where qsync-send, qsync-receive and qsync-preloader lives
-BINDIR=/usr/lib/qubes
+BINDIR=/usr/local/bin
 
 # directory where rpc service config lives
 RPCDIR=/etc/qubes-rpc
@@ -28,9 +28,9 @@ echo "Installing receiver into $RPCDIR..."  && \
 #
 go version && \
   echo "Building binaries..."
-  go build ./cmd/qsync-send && go install ./cmd/qsync-send && \
-  go build ./cmd/qsync-receive && go install ./cmd/qsync-receive && \
-  go build ./cmd/qsync-preloader && go install ./cmd/qsync-preloader
+  go build ./cmd/qsync-send && \
+  go build ./cmd/qsync-receive && \
+  go build ./cmd/qsync-preloader
 
 #
 # Install the binaries into /usr/lib/qubes
@@ -44,7 +44,7 @@ sudo cp qsync-receive $BINDIR/ && \
 #
 # The preloader requires suid flag to be set
 #
-echo "Installing preloader into $BINDIR..."
+echo "Installing preloader into $BINDIR (with suid flag)..."
 sudo cp qsync-preloader $BINDIR/ && \
     sudo chmod 4755 $BINDIR/qsync-preloader
 
