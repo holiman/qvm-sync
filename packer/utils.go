@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 )
 
-
 func SetupLogging() {
 	host, _ := os.Hostname()
 	name := filepath.Base(os.Args[0])
@@ -52,9 +51,12 @@ func WritePath(out io.Writer, path string) error {
 	return nil
 }
 func RemoveIfExist(path string) error {
-	_, err := os.Lstat(path)
+	info, err := os.Lstat(path)
 	if err != nil && os.IsNotExist(err) {
 		return nil
+	}
+	if info.IsDir() {
+		return os.RemoveAll(path)
 	}
 	return os.Remove(path)
 

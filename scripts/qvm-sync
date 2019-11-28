@@ -21,18 +21,18 @@ set -e
 #
 #
 
-# This file should be placed in  /usr/bin/qvm-sync
+# This file should ideally be placed in  /usr/bin/qvm-sync
 #
-# Or maybe /usr/local/ should be used, for persistence
-# across restarts
+# Since that doesn't survive across restarts, we'll have to
+# use /usr/local/ instead
 
-BINDIR=/usr/lib/qubes
+BINDIR=/usr/local/bin
 PROGRAM_NAME=${0##*/}
 
 OPERATION_TYPE="copy"
 TARGET_TYPE="default"
 
-cmd="$BINDIR/qrexec-client-vm "@default" qubes.Filesync $BINDIR/qsync-send \"$@\""
+cmd="/usr/lib/qubes/qrexec-client-vm "@default" qubes.Filesync $BINDIR/qsync-send $@"
 
 echo "$cmd"
 $cmd

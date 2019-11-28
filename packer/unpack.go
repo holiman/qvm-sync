@@ -39,7 +39,7 @@ type Receiver struct {
 	// root-jailed, but is used for testing
 	root string
 
-	opts Options
+	opts *Options
 }
 
 // NewReceiver creates a new receiver
@@ -51,7 +51,7 @@ func NewReceiver(in io.Reader, out io.Writer) (*Receiver, error) {
 	if v.Version != 0 {
 		return nil, fmt.Errorf("unsupported version: %d", v.Version)
 	}
-	opts := Options{
+	opts := &Options{
 		Verbosity:   int(v.Verbosity),
 		CrcUsage:    int(v.FileCrcUsage),
 		Compression: int(v.Compression),
@@ -187,15 +187,16 @@ func (r *Receiver) receiveDirMetadata(header *fileHeader) error {
 	// 1. we're now backing out of a dir, or,
 	// 2. We're visiting/creating one for the first time
 	if r.visitDir(header.path) { // first visit
-		// remember the files that were there
-		if err := r.snapshotFiles(header.path, false); err != nil {
-			return err
-		}
 		if stat, err := os.Lstat(header.path); err == nil {
 			// directory already exists -- make sure it's a dir -- otherwise delete
 			if stat.IsDir() {
+				// remember the files that were there
+				if err := r.snapshotFiles(header.path, false); err != nil {
+					return err
+				}
 				return nil // TODO: consider if we should change perms to 0700 here..?
 			}
+			// It was a file, on the local system
 			if err := RemoveIfExist(header.path); err != nil {
 				return err
 			}
@@ -370,7 +371,7 @@ func (r *Receiver) receiveMetadata() error {
 		}
 		r.removeSnapshot(hdr.path)
 		if err := r.processItemMetadata(hdr); err != nil {
-			return err
+			return fmt.Errorf("error processing metadata for %v: %v", hdr.path, err)
 		} else {
 			lastName = hdr.path
 		}
@@ -414,12 +415,12 @@ func (r *Receiver) sendStatusAndCrc(code int, lastFilename string) error {
 	if err := result.marshallBinary(r.out); err != nil {
 		return err
 	}
-	if len(lastFilename) == 0 {
-		return nil
-	}
 	extension := &resultHeaderExt{
 		LastNameLen: uint32(len(lastFilename)) + 1,
 		LastName:    lastFilename,
+	}
+	if len(lastFilename) == 0 {
+		extension.LastNameLen = 0
 	}
 	if err := extension.marshallBinary(r.out); err != nil {
 		return fmt.Errorf("failed sending result extension: %v", err)
