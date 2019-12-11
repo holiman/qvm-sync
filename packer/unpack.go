@@ -33,8 +33,8 @@ type Receiver struct {
 	requestList []uint32            // list of files (indexes) to request
 	toDelete    map[string]struct{} // list of local files to delete
 
-	dirStack []string // stack of directories we visit/create
-
+	dirStack            []string // stack of directories we visit/create
+	deferredPermissions []*fileHeader
 	// place to store stuff in. Defaults to empty string, as we're normally
 	// root-jailed, but is used for testing
 	root string
@@ -94,6 +94,10 @@ func (r *Receiver) Sync() error {
 			r, c := cm.Stats()
 			log.Printf("Data sent, raw: %d, compresed: %d", r, c)
 		}
+	}
+	// Fix perms
+	for _, hdr := range r.deferredPermissions {
+		hdr.fixTimesAndPerms()
 	}
 	for f, _ := range r.toDelete {
 		info, err := os.Lstat(f)
@@ -187,29 +191,33 @@ func (r *Receiver) receiveDirMetadata(header *fileHeader) error {
 	// 1. we're now backing out of a dir, or,
 	// 2. We're visiting/creating one for the first time
 	if r.visitDir(header.path) { // first visit
-		if stat, err := os.Lstat(header.path); err == nil {
-			// directory already exists -- make sure it's a dir -- otherwise delete
-			if stat.IsDir() {
-				// remember the files that were there
-				if err := r.snapshotFiles(header.path, false); err != nil {
-					return err
-				}
-				return nil // TODO: consider if we should change perms to 0700 here..?
+		stat, err := os.Lstat(header.path)
+		if err == nil {
+			// If it's not a dir, delete it
+			if !stat.IsDir() {
+				return RemoveIfExist(header.path)
 			}
-			// It was a file, on the local system
-			if err := RemoveIfExist(header.path); err != nil {
+			// We also need ensure that we have permissions in the directory
+			// this is later set correctly on the second visit
+			if err := os.Chmod(header.path, 0700); err != nil {
 				return err
 			}
+			// remember the files that were there
+			return r.snapshotFiles(header.path, false)
 		}
-		// Dir did not exist (or was removed)
-		return os.Mkdir(header.path, 0700)
-	}
-	if r.opts.Verbosity >= 5 {
-		log.Printf("Fixing perms for %v", header.path)
+		if os.IsNotExist(err) {
+			// Dir did not exist (or was removed), just create it
+			return os.Mkdir(header.path, 0700)
+		}
+		// Some other error
+		return err
 	}
 	// second visit
-	// we fix the perms after we're done with it
-	return header.fixTimesAndPerms()
+	// We can't set the perms here: if we were to set e.g rdonly perms,
+	// we will be unable to create the full files when they are transmitted.
+	// So just save the perms for later
+	r.deferFixTimesAndPerms(header)
+	return nil
 }
 
 func (r *Receiver) receiveRegularFileFullData(hdr *fileHeader) error {
@@ -232,9 +240,7 @@ func (r *Receiver) receiveRegularFileFullData(hdr *fileHeader) error {
 			return err
 		}
 		fdOut.Close()
-		if err := hdr.fixTimesAndPerms(); err != nil {
-			return err
-		}
+		return hdr.fixTimesAndPerms()
 	}
 	// Create tempfile
 	if fdOut, err = ioutil.TempFile(".", "qvm-*"); err != nil {
@@ -270,7 +276,9 @@ func (r *Receiver) receiveSymlinkFullData(hdr *fileHeader) error {
 	}
 	content := string(buf)
 	// This file may already exist.
-	RemoveIfExist(hdr.path)
+	if err := RemoveIfExist(hdr.path); err != nil {
+		return err
+	}
 	if err := os.Symlink(content, hdr.path); err != nil {
 		return err
 	}
@@ -293,6 +301,12 @@ func (r *Receiver) visitDir(path string) bool {
 	}
 	r.dirStack = r.dirStack[:len(r.dirStack)-1]
 	return false
+}
+
+// deferFixTimesAndPerms saves the times and perms for the given path, so that
+// we can set that later, when we're done with all file operations on it
+func (r *Receiver) deferFixTimesAndPerms(hdr *fileHeader) {
+	r.deferredPermissions = append(r.deferredPermissions, hdr)
 }
 
 func (r *Receiver) processItemMetadata(hdr *fileHeader) error {
@@ -430,7 +444,7 @@ func (r *Receiver) sendStatusAndCrc(code int, lastFilename string) error {
 
 func (r *Receiver) requestFiles() error {
 	if r.opts.Verbosity >= 3 {
-		log.Printf("Requesting files %d", r.requestList)
+		log.Printf("Requesting %d files", len(r.requestList))
 	}
 	if err := binary.Write(r.out, binary.LittleEndian, uint32(len(r.requestList))); err != nil {
 		return err

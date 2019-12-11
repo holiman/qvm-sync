@@ -83,7 +83,7 @@ func (s *Sender) sendItemMetadata(path string, info os.FileInfo) error {
 	header := newFileHeaderFromStat(path, info)
 
 	// Possibly replace atimensec with crc32
-	if header.isRegular() {
+	if !header.isDir() {
 		fullPath := filepath.Join(s.root, path)
 		if s.opts.CrcUsage == FileCrcAtimeNsec ||
 			s.opts.CrcUsage == FileCrcAtimeNsecMetadata {

@@ -123,7 +123,7 @@ func execJailed(uname, jail, trustedBinary string) error {
 		newPath = fmt.Sprintf("%v/%v", jail, newName)
 	)
 	if err := os.Link(trustedBinary, newPath); err != nil {
-		log.Printf("Hard linking failed: %v - trying copy instead.", err)
+		log.Print("Hard linking failed (cross-device?), trying copy instead")
 		// Hard linking fails across fs boundaries, such as
 		// /usr/lib/qubes to /home/user/
 		// We can do a manual copy instead
@@ -134,7 +134,11 @@ func execJailed(uname, jail, trustedBinary string) error {
 	log.Printf("Copy to %v ok", newPath)
 	defer func() {
 		if err := os.Remove(newPath); err != nil {
-			log.Printf("failed cleaning up %v: %v", newPath, err)
+			if os.IsNotExist(err) {
+				log.Printf("Clean up: file already removed")
+			} else {
+				log.Printf("failed cleaning up %v: %v", newPath, err)
+			}
 		} else {
 			log.Printf("Call done, cleaned up %v ok", newPath)
 		}
@@ -143,7 +147,7 @@ func execJailed(uname, jail, trustedBinary string) error {
 	if err := os.Chmod(newPath, 0755); err != nil {
 		return fmt.Errorf("chmod op failed: %v", err)
 	}
-	log.Print("Permissions fixed")
+	log.Print("Permissions ok")
 	if err := os.Chdir(destRoot); err != nil {
 		return fmt.Errorf("failed chdir: %v", err)
 	}

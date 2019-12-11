@@ -7,11 +7,13 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	rand2 "math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestMarshalUnMarshal(t *testing.T) {
@@ -261,7 +263,6 @@ func BenchmarkCrcFilesBuf(b *testing.B) {
 			testOsWalk("/home/user/go/src/github.com/ethereum/go-ethereum")
 		}
 	})
-
 }
 
 // TestSymlinkOutsideOfJailRemoval tests that if the root-jailing is not active,
@@ -324,5 +325,35 @@ func TestSymlinkOutsideOfJailRemoval(t *testing.T) {
 	if _, err := os.Stat("/tmp/linktest.target2"); err != nil {
 		t.Fatalf("File missing: %v", err)
 	}
+}
+
+func TestOverwriteROnlyFiles(t *testing.T) {
+	rand2.Seed(time.Now().Unix())
+	dir := fmt.Sprintf("/tmp/rdonlytest-%d/readonlydir", rand2.Uint32())
+	p := filepath.Join(dir, "readonlyfile")
+	// create dir with permissive perms first, so we can create the file
+	if err := os.MkdirAll(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write([]byte("This file is generated to check if we can delete files which " +
+		"have perms 'r--r--r--'"))
+	f.Close()
+
+	if err := os.Chmod(p, 0444); err != nil {
+		t.Fatal(err)
+	}
+	// If the dir doesn't have x, we can't open in
+	if err := os.Chmod(dir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	// Now, we have a rdonly directory, with an rdonly file in it. Shoot it
+	// over to a receiver
+
+	testEntireDirectory(t, dir)
+	RemoveIfExist(dir)
 
 }

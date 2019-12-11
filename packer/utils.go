@@ -51,15 +51,27 @@ func WritePath(out io.Writer, path string) error {
 	return nil
 }
 func RemoveIfExist(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil && os.IsNotExist(err) {
-		return nil
+
+	info, err := os.Stat(path)
+
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if os.IsPermission(err) {
+			if err := os.Chmod(path, 0700); err != nil {
+				return fmt.Errorf("failed changing perms: %v", err)
+			}
+			info, err = os.Stat(path)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	if info.IsDir() {
 		return os.RemoveAll(path)
 	}
 	return os.Remove(path)
-
 }
 
 var readBuf = make([]byte, 64*1000)
