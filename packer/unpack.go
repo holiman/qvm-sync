@@ -161,6 +161,7 @@ func (r *Receiver) receiveFileMetadata(hdr *fileHeader) error {
 			log.Printf("file diffs for %v: %v", hdr.path, diff)
 		}
 		r.request(r.index)
+		return nil
 	}
 	if r.opts.CrcUsage == FileCrcAtimeNsecMetadata ||
 		r.opts.CrcUsage == FileCrcAtimeNsec {
@@ -367,9 +368,8 @@ func (r *Receiver) removeSnapshot(path string) error {
 
 func (r *Receiver) receiveMetadata() error {
 	var lastName string
-	if err := r.snapshotFiles("./", true); err != nil {
-		return fmt.Errorf("snapshot failed: %v", err)
-	}
+	firstItem := true
+
 	for {
 		hdr, err := unMarshallBinary(r.in)
 		if err != nil {
@@ -382,6 +382,16 @@ func (r *Receiver) receiveMetadata() error {
 		r.totalFiles++
 		if r.filesLimit > 0 && int(r.totalFiles) > r.filesLimit {
 			return fmt.Errorf("number of files (%d) exceeded limit (%d)", r.totalFiles, r.filesLimit)
+		}
+		if firstItem{
+			// First item should be the directory the remote side is synching
+			if !hdr.isDir(){
+				return fmt.Errorf("Expected director as first entry, got %v", hdr.path)
+			}
+			if err := r.snapshotFiles(fmt.Sprintf("./%v", hdr.path), true); err != nil {
+				return fmt.Errorf("snapshot failed: %v", err)
+			}
+			firstItem = false
 		}
 		r.removeSnapshot(hdr.path)
 		if err := r.processItemMetadata(hdr); err != nil {
